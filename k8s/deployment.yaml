@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multiplexer-server
+  namespace: multiplexer
+  labels:
+    app: multiplexer-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: multiplexer-server
+  template:
+    metadata:
+      labels:
+        app: multiplexer-server
+    spec:
+      containers:
+      - name: server
+        image: joseenrique/servermultplexer:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: PORT
+          valueFrom:
+            configMapKeyRef:
+              name: multiplexer-server-config
+              key: PORT
+        - name: DOMAIN
+          valueFrom:
+            configMapKeyRef:
+              name: multiplexer-server-config
+              key: DOMAIN
+        - name: MAX_CLIENTS
+          valueFrom:
+            configMapKeyRef:
+              name: multiplexer-server-config
+              key: MAX_CLIENTS
+        - name: CHUNK_SIZE
+          valueFrom:
+            configMapKeyRef:
+              name: multiplexer-server-config
+              key: CHUNK_SIZE
+        - name: MAX_MESSAGE_SIZE
+          valueFrom:
+            configMapKeyRef:
+              name: multiplexer-server-config
+              key: MAX_MESSAGE_SIZE
+        - name: READ_TIMEOUT
+          valueFrom:
+            configMapKeyRef:
+              name: multiplexer-server-config
+              key: READ_TIMEOUT
+        - name: WRITE_TIMEOUT
+          valueFrom:
+            configMapKeyRef:
+              name: multiplexer-server-config
+              key: WRITE_TIMEOUT
+        - name: USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: multiplexer-server-auth
+              key: USERNAME
+        - name: PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: multiplexer-server-auth
+              key: PASSWORD
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /status
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /status
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      restartPolicy: Always 

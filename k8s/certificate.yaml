@@ -1,0 +1,13 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: multiplexer-cert
+  namespace: multiplexer
+spec:
+  secretName: multiplexer-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  dnsNames:
+  - multiplexer.example.com
+  - "*.multiplexer.example.com" 

@@ -1,0 +1,27 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: multiplexer-server-ingress
+  namespace: multiplexer
+  annotations:
+    kubernetes.io/ingress.class: quix-traefik
+    kubernetes.io/ingress.provider: traefik
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: 'true'
+spec:
+  tls:
+  - hosts:
+    - multiplexer.azure.byoc.quix.ai
+    secretName: multiplexer-tls
+  rules:
+  - host: multiplexer.azure.byoc.quix.ai
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: multiplexer-server
+            port:
+              number: 80 
+

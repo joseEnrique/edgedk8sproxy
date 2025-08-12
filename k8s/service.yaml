@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: multiplexer-server
+  namespace: multiplexer
+  labels:
+    app: multiplexer-server
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  - port: 443
+    targetPort: 8080
+    protocol: TCP
+    name: https
+  selector:
+    app: multiplexer-server 

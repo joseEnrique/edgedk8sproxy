@@ -1,0 +1,23 @@
+[req]
+default_bits       = 2048
+prompt             = no
+distinguished_name = dn
+req_extensions     = req_ext
+
+[dn]
+C  = ES
+ST = Madrid
+L  = Madrid
+O  = MiOrganizacion
+OU = TI
+CN = localhost
+
+[req_ext]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = localhost
+DNS.2 = tunel.mi-dominio.com
+DNS.3 = cliente1.tunel.mi-dominio.com
+DNS.4 = *.tunel.mi-dominio.com
+IP.1  = 127.0.0.1

@@ -1,0 +1,47 @@
+# Git
+.git
+.gitignore
+
+# Documentation
+README.md
+*.md
+
+# Build artifacts
+build/
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test files
+*_test.go
+test/
+
+# Kubernetes manifests
+k8s/
+
+# Scripts
+scripts/
+*.sh
+
+# Docker
+Dockerfile*
+.dockerignore
+
+# Temporary files
+*.tmp
+*.temp 
