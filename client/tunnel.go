@@ -1,379 +1,316 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
-	"strings"
+	"sync"
 	"time"
-
-	"github.com/gorilla/websocket"
 )
 
-// Run starts the client tunnel with automatic reconnection
+// Run starts the TCP tunnel client
 func (c *Client) Run() error {
-	retryCount := 0
+	log.Printf("🚀 Starting TCP tunnel client")
+	log.Printf("🔌 Connecting to server: %s:%s", c.config.ServerHost, c.config.ServerPort)
+	log.Printf("🆔 Client ID: %s", c.config.ClientID)
+	log.Printf("🎯 Forwarding all traffic to: %s:%d", c.config.ForwardHost, c.config.ForwardPort)
+
+	// OPTIMIZED: Much faster reconnection delays
+	reconnectDelay := 1 * time.Second
+	maxReconnectDelay := 10 * time.Second
 
 	for {
 		select {
 		case <-c.done:
-			log.Printf("🛑 Client stopping")
 			return nil
 		default:
-			if err := c.runConnection(); err != nil {
-				retryCount++
-
-				// Check if we've exceeded max retries
-				if c.config.MaxRetries > 0 && retryCount > c.config.MaxRetries {
-					log.Printf("❌ Max retries exceeded (%d), stopping client", c.config.MaxRetries)
-					return fmt.Errorf("max retries exceeded: %v", err)
-				}
-
-				// Use fixed delay (no exponential backoff)
-				delay := c.config.ReconnectDelay
-
+			if err := c.connect(); err != nil {
 				log.Printf("❌ Connection failed: %v", err)
-				log.Printf("🔄 Attempting to reconnect in %v (attempt %d)...", delay, retryCount)
-				time.Sleep(delay)
+				log.Printf("🔄 Retrying in %v...", reconnectDelay)
+				time.Sleep(reconnectDelay)
+				reconnectDelay *= 2
+				if reconnectDelay > maxReconnectDelay {
+					reconnectDelay = maxReconnectDelay
+				}
 				continue
 			}
-
-			// Reset retry count on successful connection
-			retryCount = 0
-		}
-	}
-}
-
-// runConnection handles a single connection session
-func (c *Client) runConnection() error {
-	log.Printf("🔌 Connecting to %s as %s", c.config.ServerURL, c.config.ClientID)
-
-	// Connect to server
-	if err := c.connect(); err != nil {
-		return fmt.Errorf("failed to connect: %v", err)
-	}
-
-	// Send initial registration
-	if err := c.sendMessage("register", map[string]string{
-		"client_id": c.config.ClientID,
-		"timestamp": time.Now().Format(time.RFC3339),
-	}); err != nil {
-		log.Printf("❌ Failed to send register message: %v", err)
-	}
-
-	// Start ping ticker
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	// Message loop
-	for {
-		select {
-		case <-c.done:
-			log.Printf("🛑 Client stopping")
-			return nil
-		case <-ticker.C:
-			// Send ping
-			if err := c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
-				log.Printf("❌ Ping failed: %v", err)
-				return fmt.Errorf("ping failed: %v", err)
-			}
-			// Send heartbeat
-			if err := c.sendMessage("heartbeat", map[string]string{
-				"timestamp": time.Now().Format(time.RFC3339),
-			}); err != nil {
-				log.Printf("❌ Failed to send heartbeat: %v", err)
-				return fmt.Errorf("heartbeat failed: %v", err)
-			}
-		default:
-			// Set read deadline with configurable timeout
-			c.conn.SetReadDeadline(time.Now().Add(c.config.ReadTimeout))
-
-			// Read message
-			log.Printf("🔍 Waiting for message from server...")
-			messageType, message, err := c.conn.ReadMessage()
-			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					log.Printf("❌ WebSocket disconnected: %v", err)
-				} else {
-					log.Printf("✅ WebSocket disconnected normally")
-				}
-
-				// Check if it's a timeout error
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					log.Printf("⏰ Read timeout - server may be busy or connection slow")
-				}
-
-				log.Printf("🔄 Connection error, will attempt to reconnect: %v", err)
-				return fmt.Errorf("read message failed: %v", err)
-			}
-
-			log.Printf("📨 Received message type: %d, size: %d bytes", messageType, len(message))
-
-			// Handle message based on type - prioritize text messages (HTTP) over binary (TCP)
-			if messageType == websocket.TextMessage {
-				// Handle JSON text messages (HTTP requests, etc.) with priority
-				if c.isTCPTunnelActive() {
-					log.Printf("📨 Processing HTTP request (TCP tunnel active)...")
-				} else {
-					log.Printf("📨 Processing HTTP request...")
-				}
-				// Process HTTP requests synchronously to ensure proper handling
-				if err := c.handleMessage(message); err != nil {
-					log.Printf("❌ Failed to handle message: %v", err)
-					// Don't return here, continue processing other messages
-				}
-			} else if messageType == websocket.BinaryMessage {
-				// Handle binary messages (TCP tunnel data) in background
-				// This prevents blocking HTTP requests
-				// Use a buffered channel to avoid blocking
-				log.Printf("📦 Received binary message: %d bytes", len(message))
-				go func() {
-					select {
-					case <-time.After(100 * time.Millisecond):
-						// Timeout to prevent blocking
-						log.Printf("⚠️ Binary message processing timeout")
-					default:
-						// Forward to registered handlers
-						c.forwardBinaryMessage(message)
-
-						// If TCP tunnel is active (kubectl mode), echo the message back to server
-						// This completes the kubectl port-forward loop
-						if c.isTCPTunnelActive() {
-							log.Printf("📤 Echoing %d bytes back to server (kubectl loop)", len(message))
-							if err := c.writeMessage(websocket.BinaryMessage, message); err != nil {
-								log.Printf("❌ Failed to echo binary message back to server: %v", err)
-							} else {
-								log.Printf("📤 Successfully echoed %d bytes back to server", len(message))
-							}
-						}
-					}
-				}()
-			} else {
-				log.Printf("⚠️ Unknown message type: %d", messageType)
+			reconnectDelay = 1 * time.Second
+			if err := c.startTunnel(); err != nil {
+				log.Printf("❌ Tunnel failed: %v", err)
+				_ = c.conn.Close()
+				log.Printf("🔄 Reconnecting...")
+				continue
 			}
 		}
 	}
 }
 
-// connect establishes WebSocket connection to server
+// connect establishes TCP connection to the server
 func (c *Client) connect() error {
-	// Add client ID to URL
-	url := fmt.Sprintf("%s?id=%s", c.config.ServerURL, c.config.ClientID)
-
-	// Close existing connection if any
-	if c.conn != nil {
-		c.conn.Close()
-		c.conn = nil
+	// Use a Dialer with TCP keepalive to keep the tunnel open reliably
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
 	}
-
-	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	conn, err := dialer.Dial("tcp", c.config.ServerHost+":"+c.config.ServerPort)
 	if err != nil {
-		return fmt.Errorf("failed to connect: %v", err)
+		return err
 	}
-
+	// Configure TCP options for low latency and robustness
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
+		_ = tcp.SetLinger(0)
+		_ = tcp.SetReadBuffer(64 * 1024)
+		_ = tcp.SetWriteBuffer(64 * 1024)
+	}
 	c.conn = conn
-	log.Printf("✅ Connected successfully")
-
-	// Set up ping/pong
-	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-		return nil
-	})
-
-	// Set connection limits
-	conn.SetReadLimit(c.config.MaxMessageSize) // Configurable max message size
-
+	log.Printf("✅ Connected to server %s:%s", c.config.ServerHost, c.config.ServerPort)
 	return nil
 }
 
-// sendMessage sends a message to the server
-func (c *Client) sendMessage(msgType string, payload interface{}) error {
-	msg := Message{
-		Type:    msgType,
-		Payload: payload,
+// startTunnel starts the TCP tunnel
+func (c *Client) startTunnel() error {
+	log.Printf("📡 Starting TCP tunnel")
+	if _, err := c.conn.Write([]byte(c.config.ClientID)); err != nil {
+		return err
 	}
-
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("failed to marshal message: %v", err)
-	}
-
-	return c.writeMessage(websocket.TextMessage, data)
+	log.Printf("✅ Client identification sent: %s", c.config.ClientID)
+	c.mutex.Lock()
+	c.active = true
+	c.mutex.Unlock()
+	return c.handleTunnel()
 }
 
-// handleMessage processes incoming messages
-func (c *Client) handleMessage(data []byte) error {
-	var msg Message
-	if err := json.Unmarshal(data, &msg); err != nil {
-		return fmt.Errorf("failed to unmarshal message: %v", err)
+// handleTunnel handles the TCP tunnel communication
+func (c *Client) handleTunnel() error {
+	log.Printf("📡 TCP tunnel active")
+
+	// Create a channel to coordinate shutdown
+	done := make(chan bool)
+	var closeOnce sync.Once
+
+	// Safe close function that only closes once
+	closeDone := func() {
+		closeOnce.Do(func() {
+			close(done)
+		})
 	}
 
-	log.Printf("📨 Received message: %s", msg.Type)
+	defer func() {
+		closeDone()
+		c.mutex.Lock()
+		c.active = false
+		c.mutex.Unlock()
+		log.Printf("📡 TCP tunnel ended")
+	}()
 
-	switch msg.Type {
-	case "proxy_request":
-		return c.handleProxyRequest(msg.Payload)
-	case "tcp_tunnel":
-		return c.handleTCPTunnel(msg.Payload)
-	case "tunnel_request":
-		return c.handleTunnelRequest(msg.Payload)
-	case "kubectl_connection":
-		return c.handleKubectlConnection(msg.Payload)
-	case "tunnel_ready":
-		return c.handleTunnelReady(msg.Payload)
-	default:
-		log.Printf("⚠️ Unknown message type: %s", msg.Type)
+	// Start reading from server with optimized buffer
+	go func() {
+		defer func() {
+			log.Printf("📤 Read stream ended")
+		}()
+
+		buffer := make([]byte, 32*1024)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				// NO TIMEOUTS - wait for FIN TCP from server
+				n, err := c.conn.Read(buffer)
+				if err != nil {
+					if err.Error() != "EOF" {
+						log.Printf("❌ Read error: %v", err)
+					}
+					// Signal that tunnel is broken and needs reconnection
+					closeDone()
+					return
+				}
+
+				if n > 0 {
+					data := make([]byte, n)
+					copy(data, buffer[:n])
+
+					log.Printf("📤 Received %d bytes from server", n)
+
+					// Forward ALL data to the target immediately
+					c.forwardToTarget(data)
+				}
+			}
+		}
+	}()
+
+	// Wait for tunnel to be closed by server (FIN TCP) or client shutdown
+	select {
+	case <-done:
+		// Tunnel was broken, return error to trigger reconnection
+		return fmt.Errorf("tunnel connection lost")
+	case <-c.done:
+		// Client was stopped intentionally
 		return nil
+	}
+}
+
+// forwardToTarget forwards all data to the target host
+func (c *Client) forwardToTarget(data []byte) {
+	log.Printf("📤 Forwarding %d bytes to target %s:%d", len(data), c.config.ForwardHost, c.config.ForwardPort)
+
+	// Get or create connection to target
+	targetConn, err := c.getOrCreateTargetConnection()
+	if err != nil {
+		log.Printf("❌ Failed to get target connection: %v", err)
+		// Send error response back to server
+		errorResp := fmt.Sprintf("Forward Error: %v", err)
+		c.conn.Write([]byte(errorResp))
+		return
+	}
+
+	log.Printf("🔌 Using target connection: %s", targetConn.RemoteAddr().String())
+
+	// Forward data to target - NO DELAYS
+	if _, err := targetConn.Write(data); err != nil {
+		log.Printf("❌ Failed to forward data to target: %v", err)
+		// Close dead connection and try to create new one
+		_ = targetConn.Close()
+		c.forwardMutex.Lock()
+		c.forwardConn = nil
+		c.forwardMutex.Unlock()
+		return
+	}
+
+	log.Printf("✅ Successfully forwarded %d bytes to target", len(data))
+
+	// Start reading response from target in a separate goroutine (only if not already running)
+	c.forwardMutex.Lock()
+	if !c.targetReaderActive {
+		c.targetReaderActive = true
+		go c.readTargetResponse(targetConn)
+	}
+	c.forwardMutex.Unlock()
+}
+
+// getOrCreateTargetConnection gets or creates a connection to the target
+func (c *Client) getOrCreateTargetConnection() (net.Conn, error) {
+	c.forwardMutex.Lock()
+	defer c.forwardMutex.Unlock()
+
+	// Check if target connection exists and is active
+	if c.forwardConn != nil {
+		// Quick test if connection is still alive
+		if err := c.quickTestConnection(c.forwardConn); err == nil {
+			return c.forwardConn, nil
+		}
+		// Connection is dead, close it
+		_ = c.forwardConn.Close()
+		c.forwardConn = nil
+		c.targetReaderActive = false
+	}
+
+	// Connect to the target with timeout
+	dialer := &net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
+	conn, err := dialer.Dial("tcp", fmt.Sprintf("%s:%d", c.config.ForwardHost, c.config.ForwardPort))
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to target %s:%d: %v", c.config.ForwardHost, c.config.ForwardPort, err)
+	}
+
+	// Set TCP options for better performance
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		_ = tcpConn.SetLinger(0)
+		// Increase buffer sizes
+		_ = tcpConn.SetReadBuffer(64 * 1024)
+		_ = tcpConn.SetWriteBuffer(64 * 1024)
+	}
+
+	// Successfully connected to target
+	c.forwardConn = conn
+	c.targetReaderActive = false // Will be set to true when we start reading
+	log.Printf("✅ Created new connection to target %s:%d", c.config.ForwardHost, c.config.ForwardPort)
+	return conn, nil
+}
+
+// quickTestConnection tests if a connection is still alive with minimal overhead
+func (c *Client) quickTestConnection(conn net.Conn) error {
+	// Set a very short timeout for testing
+	conn.SetDeadline(time.Now().Add(50 * time.Millisecond))
+
+	// Try to read 1 byte (this will fail if connection is dead)
+	buf := make([]byte, 1)
+	_, err := conn.Read(buf)
+
+	// Reset deadline
+	conn.SetDeadline(time.Time{})
+
+	return err
+}
+
+// readTargetResponse reads response from target and forwards to tunnel
+func (c *Client) readTargetResponse(targetConn net.Conn) {
+	defer func() {
+		log.Printf("📤 Target response reader ended")
+		c.forwardMutex.Lock()
+		c.targetReaderActive = false
+		c.forwardMutex.Unlock()
+	}()
+
+	buffer := make([]byte, 32*1024)
+	for {
+		// NO TIMEOUTS - just read directly, wait for FIN TCP
+		n, err := targetConn.Read(buffer)
+		if err != nil {
+			if err.Error() == "EOF" {
+				log.Printf("📤 Target connection closed (EOF)")
+			} else {
+				log.Printf("❌ Target read error: %v", err)
+			}
+			return
+		}
+
+		if n > 0 {
+			data := make([]byte, n)
+			copy(data, buffer[:n])
+
+			log.Printf("📤 Received %d bytes from target, forwarding to tunnel", n)
+
+			// Forward target response back to server through tunnel - NO DELAYS
+			if _, err := c.conn.Write(data); err != nil {
+				log.Printf("❌ Failed to forward target response to tunnel: %v", err)
+				return
+			}
+
+			log.Printf("✅ Successfully forwarded %d bytes from target to server", n)
+		}
 	}
 }
 
 // Stop stops the client
 func (c *Client) Stop() {
+	log.Printf("🛑 Stopping client")
 	close(c.done)
+
+	c.mutex.Lock()
 	if c.conn != nil {
-		c.conn.Close()
+		_ = c.conn.Close()
 	}
-}
+	c.active = false
+	c.mutex.Unlock()
 
-// handleTunnelRequest handles tunnel requests from the server
-func (c *Client) handleTunnelRequest(payload interface{}) error {
-	// Convert payload to tunnel request
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal payload: %v", err)
+	// Close target connection
+	c.forwardMutex.Lock()
+	if c.forwardConn != nil {
+		log.Printf("🔌 Closing target connection")
+		_ = c.forwardConn.Close()
+		c.forwardConn = nil
 	}
+	c.forwardMutex.Unlock()
 
-	var tunnelReq struct {
-		TunnelID  string `json:"tunnel_id"`
-		Data      string `json:"data"`
-		Direction string `json:"direction"`
-	}
-
-	if err := json.Unmarshal(payloadBytes, &tunnelReq); err != nil {
-		return fmt.Errorf("failed to unmarshal tunnel request: %v", err)
-	}
-
-	log.Printf("📡 Received tunnel request: %s -> %s (%d bytes)", tunnelReq.Direction, tunnelReq.TunnelID, len(tunnelReq.Data))
-
-	// Convert string data back to bytes
-	data := []byte(tunnelReq.Data)
-
-	// Check if this looks like HTTP text or binary data
-	if c.isHTTPText(data) {
-		// This looks like HTTP text, process it normally
-		requestStr := string(data)
-		log.Printf("📡 HTTP Request: %s", requestStr[:min(len(requestStr), 200)])
-
-		// Extract target from tunnel ID (e.g., "tunnel-client1-8081-1234567890" -> "nginx")
-		target := "nginx" // Default target for now
-		if strings.Contains(tunnelReq.TunnelID, "client1") {
-			target = "nginx.default"
-		}
-
-		// Connect to the actual pod nginx
-		if err := c.processKubectlRequest(target, data); err != nil {
-			log.Printf("❌ Failed to process kubectl request: %v", err)
-			// Send error response back to kubectl
-			c.sendErrorResponseToKubectl(data)
-		}
-	} else {
-		// This is binary data, handle it differently
-		log.Printf("📡 Binary data received from kubectl (%d bytes)", len(data))
-
-		// Extract target from tunnel ID
-		target := "nginx.default" // Default target for now
-
-		// For binary data, we need to process it according to kubectl's protocol
-		if err := c.processBinaryKubectlData(target, data); err != nil {
-			log.Printf("❌ Failed to process binary kubectl data: %v", err)
-		}
-	}
-
-	return nil
-}
-
-// handleKubectlConnection handles kubectl connection requests from the server
-func (c *Client) handleKubectlConnection(payload interface{}) error {
-	// Convert payload to kubectl connection
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal payload: %v", err)
-	}
-
-	var kubectlConn struct {
-		TunnelID string `json:"tunnel_id"`
-		Port     int    `json:"port"`
-		Action   string `json:"action"`
-	}
-
-	if err := json.Unmarshal(payloadBytes, &kubectlConn); err != nil {
-		return fmt.Errorf("failed to unmarshal kubectl connection: %v", err)
-	}
-
-	log.Printf("🔌 Received kubectl connection request: %s on port %d", kubectlConn.Action, kubectlConn.Port)
-
-	// Send success response
-	if err := c.sendTunnelResponse(kubectlConn.TunnelID, true, ""); err != nil {
-		return fmt.Errorf("failed to send tunnel response: %v", err)
-	}
-
-	log.Printf("✅ Tunnel response sent, waiting for server confirmation...")
-
-	// Don't start kubectl stream yet - wait for server to confirm tunnel is active
-	// The server will send a tunnel_response message when the tunnel is ready
-
-	return nil
-}
-
-// sendTunnelResponse sends a tunnel response to the server
-func (c *Client) sendTunnelResponse(tunnelID string, success bool, errorMsg string) error {
-	response := map[string]interface{}{
-		"type": "tunnel_response",
-		"payload": map[string]interface{}{
-			"tunnel_id": tunnelID,
-			"success":   success,
-			"error":     errorMsg,
-		},
-	}
-
-	data, err := json.Marshal(response)
-	if err != nil {
-		return fmt.Errorf("failed to marshal tunnel response: %v", err)
-	}
-
-	return c.writeMessage(websocket.TextMessage, data)
-}
-
-// handleTunnelReady handles tunnel ready confirmation from the server
-func (c *Client) handleTunnelReady(payload interface{}) error {
-	// Convert payload to tunnel ready
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal payload: %v", err)
-	}
-
-	var tunnelReady struct {
-		TunnelID string `json:"tunnel_id"`
-		Status   string `json:"status"`
-		Message  string `json:"message"`
-	}
-
-	if err := json.Unmarshal(payloadBytes, &tunnelReady); err != nil {
-		return fmt.Errorf("failed to unmarshal tunnel ready: %v", err)
-	}
-
-	log.Printf("🚀 Tunnel %s is ready: %s", tunnelReady.TunnelID, tunnelReady.Message)
-
-	// Now start the kubectl stream since the tunnel is confirmed active
-	c.setTCPTunnelActive(true)
-	go func() {
-		defer c.setTCPTunnelActive(false)
-		if err := c.handleKubectlStream("nginx.default"); err != nil {
-			log.Printf("❌ kubectl stream error: %v", err)
-		}
-	}()
-
-	log.Printf("✅ kubectl stream started for tunnel %s", tunnelReady.TunnelID)
-	return nil
+	log.Printf("✅ Client stopped")
 }

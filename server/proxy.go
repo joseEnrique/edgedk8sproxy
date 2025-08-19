@@ -5,44 +5,400 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
-
-	"github.com/gorilla/websocket"
 )
 
-// HandleRoot handles the root endpoint and proxy requests
-func (s *Server) HandleRoot(w http.ResponseWriter, r *http.Request) {
-	// Check if this is a kubectl request FIRST (before subdomain check)
-	// kubectl sends Upgrade: websocket and Sec-Websocket-Protocol: v5.channel.k8s.io
-	if r.Header.Get("Upgrade") == "websocket" &&
-		r.Header.Get("Sec-Websocket-Protocol") == "v5.channel.k8s.io" {
-		log.Printf("🔌 kubectl request detected (port-forward/exec)")
+// StartTCPTunnelServer starts the TCP tunnel server for client connections
+func (s *Server) StartTCPTunnelServer() {
+	listener, err := net.Listen("tcp", ":"+s.config.TCPPort)
+	if err != nil {
+		log.Printf("❌ Failed to start TCP tunnel server on port %s: %v", s.config.TCPPort, err)
+		return
+	}
+	defer listener.Close()
 
-		// Find the first available client for kubectl requests
-		s.mutex.RLock()
-		var client *Client
-		for _, c := range s.clients {
-			client = c
-			break
+	log.Printf("🔌 TCP tunnel server listening on port %s", s.config.TCPPort)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Printf("❌ Failed to accept TCP connection: %v", err)
+			continue
 		}
-		s.mutex.RUnlock()
 
-		if client == nil {
-			log.Printf("❌ No clients available for kubectl request")
-			http.Error(w, "No clients available", http.StatusServiceUnavailable)
+		log.Printf("🔌 TCP connection accepted from %s", conn.RemoteAddr())
+
+		go s.handleTCPConnection(conn)
+	}
+}
+
+// handleTCPConnection handles incoming TCP connections and determines if they are clients or users
+func (s *Server) handleTCPConnection(conn net.Conn) {
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		_ = tcpConn.SetLinger(0)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+
+	buffer := make([]byte, 1024)
+	n, err := conn.Read(buffer)
+	if err != nil {
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			log.Printf("📡 Fast classification: treating as user traffic")
+			conn.SetReadDeadline(time.Time{})
+			s.handleUserTraffic(conn, buffer[:n])
 			return
 		}
+		log.Printf("❌ Failed to read from connection: %v", err)
+		return
+	}
+	conn.SetReadDeadline(time.Time{})
 
-		log.Printf("✅ Using client %s for kubectl request", client.ID)
-		s.HandleKubectlWebSocket(w, r, client)
+	data := buffer[:n]
+	if n > 0 && n < 50 && !strings.Contains(string(data), "SSH-") && !strings.Contains(string(data), "HTTP") {
+		log.Printf("🔌 Client connection detected")
+		s.handleTCPClientConnection(conn, string(data))
+		return
+	}
+	log.Printf("📡 User traffic detected, forwarding to client")
+	s.handleUserTraffic(conn, data)
+}
+
+// handleUserTraffic handles user traffic (SSH, HTTP, kubectl, etc.) and forwards it to a client
+func (s *Server) handleUserTraffic(conn net.Conn, initialData []byte) {
+	log.Printf("📡 Handling user traffic (%d bytes)", len(initialData))
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+	}
+
+	clientID := "client1"
+
+	s.mutex.RLock()
+	client, exists := s.clients[clientID]
+	s.mutex.RUnlock()
+
+	if !exists {
+		log.Printf("❌ Client %s not found", clientID)
+		_ = conn.Close()
 		return
 	}
 
+	log.Printf("✅ Routing user traffic to client: %s", client.ID)
+
+	// Send initial data to client first
+	if len(initialData) > 0 {
+		log.Printf("📤 Sending initial %d bytes to client", len(initialData))
+		if _, err := client.TCPConn.Write(initialData); err != nil {
+			log.Printf("❌ Failed to send initial data to client: %v", err)
+			_ = conn.Close()
+			return
+		}
+		log.Printf("✅ Initial data sent to client")
+	}
+
+	// Start a new user session for this connection (concurrent)
+	go s.forwardUserToClient(conn, client)
+}
+
+// forwardUserToClient handles bidirectional forwarding between user connection and client
+func (s *Server) forwardUserToClient(userConn net.Conn, client *Client) {
+	defer userConn.Close()
+
+	log.Printf("📡 Starting direct TCP forwarding for client %s", client.ID)
+
+	// Create a done channel for this specific user session
+	done := make(chan struct{})
+	var closeOnce sync.Once
+	closeDone := func() {
+		closeOnce.Do(func() {
+			close(done)
+		})
+	}
+
+	// Create a response channel for this user connection
+	responseChan := make(chan []byte, 100)
+
+	// Register this user connection to receive responses
+	client.tunnelMutex.Lock()
+	if client.userConnections == nil {
+		client.userConnections = make(map[string]chan []byte)
+	}
+	userID := fmt.Sprintf("%s-%d", userConn.RemoteAddr().String(), time.Now().UnixNano())
+	client.userConnections[userID] = responseChan
+	client.tunnelMutex.Unlock()
+
+	// Clean up when this function exits
+	defer func() {
+		client.tunnelMutex.Lock()
+		delete(client.userConnections, userID)
+		client.tunnelMutex.Unlock()
+		close(responseChan)
+	}()
+
+	// User to Tunnel - only writing, no reading
+	go func() {
+		defer func() {
+			log.Printf("📤 User to Tunnel stream ended")
+		}()
+
+		buffer := make([]byte, 32*1024)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				n, err := userConn.Read(buffer)
+				if err != nil {
+					if isConnectionClosed(err) {
+						log.Printf("📤 User connection closed gracefully")
+						closeDone()
+						return
+					}
+					log.Printf("❌ User read error: %v", err)
+					closeDone()
+					return
+				}
+
+				if n > 0 {
+					// Write to tunnel with mutex to prevent conflicts
+					client.writerMu.Lock()
+					if _, err := client.TCPConn.Write(buffer[:n]); err != nil {
+						client.writerMu.Unlock()
+						if isConnectionClosed(err) {
+							log.Printf("📤 Tunnel connection closed during write")
+							closeDone()
+							return
+						}
+						log.Printf("❌ Failed to write to tunnel: %v", err)
+						closeDone()
+						return
+					}
+					client.writerMu.Unlock()
+				}
+			}
+		}
+	}()
+
+	// Response reader from channel (no reading from tunnel)
+	go func() {
+		defer func() {
+			log.Printf("📥 Response reader ended")
+		}()
+
+		for {
+			select {
+			case <-done:
+				return
+			case response, ok := <-responseChan:
+				if !ok {
+					return
+				}
+				// Write response to user connection
+				if _, err := userConn.Write(response); err != nil {
+					if isConnectionClosed(err) {
+						log.Printf("📥 User connection closed")
+						closeDone()
+						return
+					}
+					log.Printf("❌ Failed to write to user: %v", err)
+					closeDone()
+					return
+				}
+			}
+		}
+	}()
+
+	// Wait for this user session to end (tunnel stays open FOREVER)
+	<-done
+	log.Printf("📡 User session ended for client %s (tunnel remains persistent)", client.ID)
+}
+
+// isConnectionClosed checks if an error indicates a closed connection
+func isConnectionClosed(err error) bool {
+	if err == nil {
+		return false
+	}
+	es := err.Error()
+	return es == "EOF" || strings.Contains(es, "use of closed network connection") || strings.Contains(es, "connection reset by peer") || strings.Contains(es, "broken pipe")
+}
+
+// handleTCPClientConnection handles a TCP connection from a client
+func (s *Server) handleTCPClientConnection(conn net.Conn, clientID string) {
+	log.Printf("🔌 Client %s connected via TCP tunnel", clientID)
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+	}
+
+	client := &Client{
+		ID:              clientID,
+		TCPConn:         conn,
+		Connected:       time.Now(),
+		LastSeen:        time.Now(),
+		Requests:        0,
+		BytesIn:         0,
+		BytesOut:        0,
+		userConnections: make(map[string]chan []byte), // Initialize map for user connections
+		done:            make(chan bool),              // Initialize done channel
+	}
+
+	s.mutex.Lock()
+	s.clients[clientID] = client
+	s.mutex.Unlock()
+
+	log.Printf("✅ Created new TCP client: %s", clientID)
+
+	// Start the central tunnel reader that distributes responses
+	go s.tunnelReader(client)
+
+	// Start TCP tunnel handling
+	s.handleTCPTunnel(conn, clientID)
+}
+
+// handleTCPTunnel handles the TCP tunnel between server and client
+func (s *Server) handleTCPTunnel(conn net.Conn, clientID string) {
+	log.Printf("🔌 Starting PERSISTENT TCP tunnel for client: %s", clientID)
+
+	// Get client reference
+	s.mutex.RLock()
+	client, exists := s.clients[clientID]
+	s.mutex.RUnlock()
+
+	if !exists {
+		log.Printf("❌ Client %s not found during tunnel handling", clientID)
+		return
+	}
+
+	// Mark tunnel as active
+	client.tunnelMutex.Lock()
+	client.isActive = true
+	client.tunnelMutex.Unlock()
+
+	log.Printf("✅ TCP tunnel established successfully for client: %s", clientID)
+
+	// PERSISTENT TUNNEL: This connection NEVER closes
+	// Only close if the client sends FIN TCP or server shuts down
+	// But we don't read from it here - tunnelReader handles all data
+
+	// Just wait for the connection to be closed by client
+	// We can detect this by checking if the connection is still alive
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Check if connection is still alive without reading data
+			if err := conn.SetReadDeadline(time.Now().Add(1 * time.Millisecond)); err != nil {
+				log.Printf("🔌 Tunnel connection lost for client %s", clientID)
+				goto cleanup
+			}
+
+			// Try to read 1 byte to check if connection is alive
+			buf := make([]byte, 1)
+			if _, err := conn.Read(buf); err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					// Timeout is normal, connection is alive
+					conn.SetReadDeadline(time.Time{}) // Reset deadline
+					continue
+				}
+				// Connection is dead
+				log.Printf("🔌 Tunnel connection lost for client %s: %v", clientID, err)
+				goto cleanup
+			}
+
+			// Reset deadline
+			conn.SetReadDeadline(time.Time{})
+
+		case <-client.done:
+			log.Printf("🔌 Client %s requested tunnel closure", clientID)
+			goto cleanup
+		}
+	}
+
+cleanup:
+	// Clean up when tunnel is closed by client
+	log.Printf("🔌 TCP tunnel ended for client: %s", clientID)
+	client.tunnelMutex.Lock()
+	client.isActive = false
+	client.tunnelMutex.Unlock()
+
+	s.mutex.Lock()
+	delete(s.clients, clientID)
+	s.mutex.Unlock()
+
+	conn.Close()
+}
+
+// tunnelReader is the central reader that distributes responses to user connections
+func (s *Server) tunnelReader(client *Client) {
+	defer func() {
+		log.Printf("🔌 Tunnel reader ended for client %s", client.ID)
+	}()
+
+	buffer := make([]byte, 32*1024)
+	for {
+		n, err := client.TCPConn.Read(buffer)
+		if err != nil {
+			if isConnectionClosed(err) {
+				log.Printf("🔌 Tunnel connection closed")
+				return
+			}
+			// Don't treat timeouts as fatal errors - just continue
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				log.Printf("⚠️ Tunnel read timeout, continuing...")
+				continue
+			}
+			log.Printf("❌ Tunnel read error: %v", err)
+			return
+		}
+
+		if n > 0 {
+			data := buffer[:n]
+
+			// This is raw response data, send to all user connections
+			client.tunnelMutex.RLock()
+			for userID, responseQueue := range client.userConnections {
+				select {
+				case responseQueue <- data:
+					// Response queued successfully
+				default:
+					// Queue full, drop response
+					log.Printf("⚠️ Response queue full for user %s, dropping response", userID)
+				}
+			}
+			client.tunnelMutex.RUnlock()
+		}
+	}
+}
+
+// processTCPData processes data received from TCP client
+func (s *Server) processTCPData(client *Client, data []byte) {
+	log.Printf("📦 Processing %d bytes from TCP client %s", len(data), client.ID)
+
+	// The client is sending data from the target back to the server
+	// This data should be forwarded to the user connection, not echoed back
+	// We don't need to process it, just log it for debugging
+
+	log.Printf("📥 Received %d bytes from client %s (target response)", len(data), client.ID)
+
+	// Note: This data should be automatically forwarded to the user connection
+	// by the bidirectional forwarding logic in forwardUserToClient
+	// We don't need to do anything here
+}
+
+// HandleRoot handles the root endpoint and routes requests based on subdomain
+func (s *Server) HandleRoot(w http.ResponseWriter, r *http.Request) {
 	// Extract subdomain from host
 	host := r.Host
 	subdomain := ""
+
 	if idx := strings.Index(host, "."); idx > 0 {
 		subdomain = host[:idx]
 	}
@@ -56,310 +412,48 @@ func (s *Server) HandleRoot(w http.ResponseWriter, r *http.Request) {
 	// Find client by subdomain
 	client := s.GetClientBySubdomain(subdomain)
 	if client == nil {
-		http.Error(w, "Client not found", http.StatusNotFound)
+		http.Error(w, fmt.Sprintf("Client '%s' not found", subdomain), http.StatusNotFound)
 		return
 	}
 
-	// Check if this is a TCP tunnel request (kubectl port-forward)
-	// kubectl sends Upgrade: SPDY/3.1 and X-Stream-Protocol-Version: portforward.k8s.io
-	if r.Header.Get("Upgrade") == "tcp" ||
-		(r.Header.Get("Upgrade") == "SPDY/3.1" && r.Header.Get("X-Stream-Protocol-Version") == "portforward.k8s.io") {
-		s.HandleTCPTunnel(w, r, client)
-		return
-	}
+	log.Printf("🌐 Routing request for subdomain '%s' to client '%s'", subdomain, client.ID)
 
-	// ALL other requests (including curl to port-forward) go through WebSocket
-	// This ensures everything works through WebSockets as requested
-	log.Printf("🌐 All HTTP requests go through WebSocket for client: %s", client.ID)
-	s.ProxyRequest(w, r, client)
+	// Forward the request to the client via TCP tunnel
+	s.forwardHTTPRequestToClient(w, r, client)
 }
 
-// HandleTCPTunnel handles TCP tunnel requests (for kubectl port-forward)
-func (s *Server) HandleTCPTunnel(w http.ResponseWriter, r *http.Request, client *Client) {
-	log.Printf("🔌 TCP tunnel request for %s", client.ID)
+// GetClientBySubdomain finds a client by subdomain
+func (s *Server) GetClientBySubdomain(subdomain string) *Client {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
 
-	// Get target from header, query parameter, or extract from kubectl path
-	target := r.Header.Get("X-Target")
-	if target == "" {
-		target = r.URL.Query().Get("target")
+	// Look for exact match first
+	if client, exists := s.clients[subdomain]; exists {
+		return client
 	}
 
-	// If still no target, try to extract from kubectl port-forward path
-	// kubectl path format: /api/v1/namespaces/{namespace}/pods/{pod}/portforward
-	if target == "" {
-		path := r.URL.Path
-		log.Printf("🔍 Extracting target from path: %s", path)
-
-		// Extract namespace and pod from path
-		// Example: /api/v1/namespaces/default/pods/my-pod/portforward
-		parts := strings.Split(path, "/")
-		if len(parts) >= 6 && parts[1] == "api" && parts[2] == "v1" && parts[3] == "namespaces" {
-			namespace := parts[4]
-			pod := parts[6]
-			// Use the actual pod name without port for kubectl port-forward
-			target = fmt.Sprintf("%s.%s", pod, namespace)
-			log.Printf("🎯 Extracted target: %s", target)
+	// If no exact match, look for clients that start with the subdomain
+	for clientID, client := range s.clients {
+		if strings.HasPrefix(clientID, subdomain) {
+			return client
 		}
 	}
 
-	if target == "" {
-		// For kubectl port-forward, use a default target
-		target = "kubernetes.default.svc.cluster.local"
-		log.Printf("⚠️ No target specified, using default: %s", target)
-	}
-
-	log.Printf("🎯 Final target: %s", target)
-
-	// For kubectl port-forward, we need to handle SPDY/3.1 upgrade
-	// kubectl doesn't use WebSocket, it uses SPDY protocol
-	if r.Header.Get("Upgrade") == "SPDY/3.1" {
-		log.Printf("🔄 Handling SPDY/3.1 upgrade for kubectl port-forward")
-
-		// Send tunnel request to client
-		tunnelMsg := Message{
-			Type: "tcp_tunnel",
-			Payload: TCPTunnelRequest{
-				Target: target,
-			},
-		}
-
-		data, err := json.Marshal(tunnelMsg)
-		if err != nil {
-			log.Printf("❌ Failed to marshal tunnel request: %v", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-
-		// Send to client via WebSocket
-		if err := client.Conn.WriteMessage(websocket.TextMessage, data); err != nil {
-			log.Printf("❌ Failed to send tunnel request to client: %v", err)
-			http.Error(w, "Failed to establish tunnel", http.StatusInternalServerError)
-			return
-		}
-
-		// For kubectl, we need to respond with 101 Switching Protocols
-		w.Header().Set("Connection", "Upgrade")
-		w.Header().Set("Upgrade", "SPDY/3.1")
-		w.WriteHeader(http.StatusSwitchingProtocols)
-
-		log.Printf("✅ SPDY upgrade response sent")
-
-		// Handle SPDY streaming directly between kubectl and user
-		s.handleSPDYStream(w, r, client, target)
-		return
-	}
-
-	// For regular WebSocket TCP tunnel
-	wsConn, err := s.upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("❌ Failed to upgrade to WebSocket for TCP tunnel: %v", err)
-		return
-	}
-	defer wsConn.Close()
-
-	log.Printf("✅ WebSocket upgraded for TCP tunnel")
-
-	// Handle TCP tunnel streaming
-	s.handleTCPStream(wsConn, client, target)
+	return nil
 }
 
-// handleTCPStream handles the actual TCP streaming
-func (s *Server) handleTCPStream(wsConn *websocket.Conn, client *Client, target string) {
-	log.Printf("📡 Starting TCP stream for %s to target %s", client.ID, target)
+// forwardHTTPRequestToClient forwards HTTP requests to a specific client via TCP tunnel
+func (s *Server) forwardHTTPRequestToClient(w http.ResponseWriter, r *http.Request, client *Client) {
+	log.Printf("📡 Forwarding HTTP request to client %s: %s %s", client.ID, r.Method, r.URL.Path)
 
-	// Create a channel to coordinate shutdown
-	done := make(chan bool)
-	defer close(done)
-
-	// Start goroutine to handle WebSocket to TCP streaming (kubectl -> client)
-	go func() {
-		defer func() {
-			wsConn.Close()
-			log.Printf("📤 WebSocket to TCP stream ended for %s", client.ID)
-		}()
-
-		for {
-			select {
-			case <-done:
-				return
-			default:
-				// Read binary message from WebSocket (data from kubectl)
-				_, message, err := wsConn.ReadMessage()
-				if err != nil {
-					if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-						log.Printf("❌ WebSocket read error (kubectl): %v", err)
-					}
-					return
-				}
-
-				// Forward data to client (kubectl -> local service)
-				if err := client.Conn.WriteMessage(websocket.BinaryMessage, message); err != nil {
-					log.Printf("❌ Failed to forward data to client: %v", err)
-					return
-				}
-
-				log.Printf("📤 Forwarded %d bytes from kubectl to client", len(message))
-			}
-		}
-	}()
-
-	// Start goroutine to handle TCP to WebSocket streaming (client -> kubectl)
-	go func() {
-		defer func() {
-			wsConn.Close()
-			log.Printf("📥 TCP to WebSocket stream ended for %s", client.ID)
-		}()
-
-		// Listen for binary messages from client (data from local service)
-		for {
-			select {
-			case <-done:
-				return
-			default:
-				// Read message from client WebSocket
-				messageType, message, err := client.Conn.ReadMessage()
-				if err != nil {
-					if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-						log.Printf("❌ Client WebSocket read error: %v", err)
-					}
-					return
-				}
-
-				// Only forward binary messages (TCP data)
-				if messageType == websocket.BinaryMessage {
-					// Forward data to kubectl
-					if err := wsConn.WriteMessage(websocket.BinaryMessage, message); err != nil {
-						log.Printf("❌ Failed to forward data to kubectl: %v", err)
-						return
-					}
-
-					log.Printf("📥 Forwarded %d bytes from client to kubectl", len(message))
-				} else {
-					// Handle text messages (control messages)
-					log.Printf("📨 Received text message from client: %s", string(message))
-				}
-			}
-		}
-	}()
-
-	// Keep the connection alive and handle cleanup
-	select {
-	case <-done:
-		log.Printf("📡 TCP stream ended for %s", client.ID)
-	}
-}
-
-// handleSPDYStream handles SPDY streaming for kubectl port-forward
-// This function handles the direct tunnel between kubectl and the user
-func (s *Server) handleSPDYStream(w http.ResponseWriter, r *http.Request, client *Client, target string) {
-	// Get the underlying connection BEFORE sending any response
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		log.Printf("❌ ResponseWriter is not a Hijacker")
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	// Check if client is active
+	client.tunnelMutex.RLock()
+	if !client.isActive {
+		client.tunnelMutex.RUnlock()
+		http.Error(w, "Client not active", http.StatusServiceUnavailable)
 		return
 	}
-
-	conn, bufrw, err := hj.Hijack()
-	if err != nil {
-		log.Printf("❌ Failed to hijack connection: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-	defer conn.Close()
-
-	// Send SPDY upgrade response
-	bufrw.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
-	bufrw.WriteString("Connection: Upgrade\r\n")
-	bufrw.WriteString("Upgrade: SPDY/3.1\r\n")
-	bufrw.WriteString("\r\n")
-	bufrw.Flush()
-
-	log.Printf("✅ SPDY connection established")
-
-	// Create a channel to coordinate shutdown
-	done := make(chan bool)
-	defer close(done)
-
-	// Start goroutine to handle SPDY to user streaming (kubectl -> user)
-	go func() {
-		defer func() {
-			log.Printf("📤 SPDY to user stream ended for %s", client.ID)
-		}()
-
-		buffer := make([]byte, 4096)
-		for {
-			select {
-			case <-done:
-				return
-			default:
-				// Read from SPDY connection (kubectl)
-				n, err := conn.Read(buffer)
-				if err != nil {
-					if err.Error() != "EOF" {
-						log.Printf("❌ SPDY read error: %v", err)
-					}
-					return
-				}
-
-				if n > 0 {
-					// Forward data to client via WebSocket (binary message)
-					// The client will handle sending it back to the user
-					log.Printf("📤 Sending %d bytes from kubectl to client", n)
-					if err := client.writeMessage(websocket.BinaryMessage, buffer[:n]); err != nil {
-						log.Printf("❌ Failed to forward data to client: %v", err)
-						return
-					}
-
-					log.Printf("📤 Successfully forwarded %d bytes from kubectl to client", n)
-				}
-			}
-		}
-	}()
-
-	// Start goroutine to handle client to SPDY streaming (client -> kubectl)
-	go func() {
-		defer func() {
-			conn.Close()
-			log.Printf("📥 Client to SPDY stream ended for %s", client.ID)
-		}()
-
-		// Create a channel to receive binary messages from the client
-		binaryChan := make(chan []byte, 100)
-
-		// Register this channel with the client for binary message routing
-		client.registerBinaryHandler(binaryChan)
-		defer client.unregisterBinaryHandler(binaryChan)
-
-		log.Printf("📡 Waiting for binary messages from client for kubectl forwarding")
-
-		for {
-			select {
-			case <-done:
-				return
-			case message := <-binaryChan:
-				// Forward data to SPDY connection (kubectl)
-				log.Printf("📥 Sending %d bytes from client to kubectl", len(message))
-				if _, err := conn.Write(message); err != nil {
-					log.Printf("❌ Failed to forward data to kubectl: %v", err)
-					return
-				}
-
-				log.Printf("📥 Successfully sent %d bytes from client to kubectl", len(message))
-			}
-		}
-	}()
-
-	// Keep the connection alive
-	select {
-	case <-done:
-		log.Printf("📡 SPDY stream ended for %s", client.ID)
-	}
-}
-
-// ProxyRequest forwards an HTTP request to a client and waits for response
-func (s *Server) ProxyRequest(w http.ResponseWriter, r *http.Request, client *Client) {
-	log.Printf("🌐 Proxying %s %s for %s", r.Method, r.URL.Path, client.ID)
+	client.tunnelMutex.RUnlock()
 
 	// Read request body
 	body, err := io.ReadAll(r.Body)
@@ -369,235 +463,107 @@ func (s *Server) ProxyRequest(w http.ResponseWriter, r *http.Request, client *Cl
 		return
 	}
 
-	// Convert headers to map with Forward- header transformation
-	headers := make(map[string]string)
-	for key, values := range r.Header {
-		//fmt.Println(key, values)
+	// Create HTTP request message to send via TCP tunnel
+	httpMsg := fmt.Sprintf("%s %s HTTP/1.1\r\n", r.Method, r.URL.Path)
 
-		// Transform any Forward- headers by removing the prefix
-		if strings.HasPrefix(key, "Forward-") {
-			// Remove "Forward-" prefix and convert to lowercase
-			transformedKey := strings.TrimPrefix(key, "Forward-")
-			headers[transformedKey] = values[0]
-			log.Printf("🔄 Forward header: %s → %s", key, transformedKey)
-		} else {
-			headers[key] = values[0] // Take first value
+	// Add headers
+	for key, values := range r.Header {
+		for _, value := range values {
+			httpMsg += fmt.Sprintf("%s: %s\r\n", key, value)
 		}
 	}
-	//headers["Authorization"] = "Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6InNqcmVlbjByQ2lJVTJuOWVBNS1BbzNoY0tIS0gzSGdVZWFlUGR4RVhKWW8ifQ.eyJhdWQiOlsiaHR0cHM6Ly9rdWJlcm5ldGVzLmRlZmF1bHQuc3ZjLmNsdXN0ZXIubG9jYWwiLCJrM3MiXSwiZXhwIjoxNzU0NjQ0OTgyLCJpYXQiOjE3NTQ2NDEzODIsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiODkxOWQxMTUtMjMwZi00NDQ1LTlmYmMtMzU4MDQ5YzdkNzE4Iiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJrdWJlLXN5c3RlbSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJwcm94eS1zYSIsInVpZCI6IjMyYzRjOTU4LWIzZWUtNGQwYi1iY2IwLTMyZmQ1MjhhMWIwZSJ9fSwibmJmIjoxNzU0NjQxMzgyLCJzdWIiOiJzeXN0ZW06c2VydmljZWFjY291bnQ6a3ViZS1zeXN0ZW06cHJveHktc2EifQ.BBjqgwBCt1OvFlF_joW7y99vG4a9I_yG_dfS9IaEwvGptykwsgBtwH037jXnfBbMC7VfgIfyEfZrMBF0ZqTFieQjDChVYKp84kuCaIali6H6rQubQ2IJFmAAfnGA28zaYorjTitdfYm-DjlPazl7BPgbF970eayTEW0zvuAbEsuPZImXXGO0WAvCkjS6fDc95M8E-jcRuyREiDHPAAlb-H0I8O-rjWWjcejtXCoyphpR9UYHlY7v-VNNekPiywS0fHAW8_8UY-AtMiKNCHmYR1Lz6mAxUNE4mIHjCNM9nNN02T1dgj8oQ9yW7L5ewKFFoXraijcWvOYX0S9zOr7mrw"
-	headers["Authorization"] = "Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6InNqcmVlbjByQ2lJVTJuOWVBNS1BbzNoY0tIS0gzSGdVZWFlUGR4RVhKWW8ifQ.eyJhdWQiOlsiaHR0cHM6Ly9rdWJlcm5ldGVzLmRlZmF1bHQuc3ZjLmNsdXN0ZXIubG9jYWwiLCJrM3MiXSwiZXhwIjoxNzU0OTkyODczLCJpYXQiOjE3NTQ5ODkyNzMsImlzcyI6Imh0dHBzOi8va3ViZXJuZXRlcy5kZWZhdWx0LnN2Yy5jbHVzdGVyLmxvY2FsIiwianRpIjoiN2Y0NGNkOGMtOWIxZS00ZDhmLThhOGEtYWZkYjYxNzcwMjcyIiwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJrdWJlLXN5c3RlbSIsInNlcnZpY2VhY2NvdW50Ijp7Im5hbWUiOiJwcm94eS1zYSIsInVpZCI6IjMyYzRjOTU4LWIzZWUtNGQwYi1iY2IwLTMyZmQ1MjhhMWIwZSJ9fSwibmJmIjoxNzU0OTg5MjczLCJzdWIiOiJzeXN0ZW06c2VydmljZWFjY291bnQ6a3ViZS1zeXN0ZW06cHJveHktc2EifQ.bWZS0n-l9e0CDTkOL_3sbxwGALIxNYRq4ZkKRP-TnXt77q0FHHG_ZlPfHn6jD5PIgVeMRgcNVHSbzRGCXvragDA2Gnnw1HCTL3Qy0_x_8gcKw5QdHcESo-KVlmBkXawghr1oRcWmdSH7qQqXr_B7R9LXp1Ath1EF6YUKD5Fgf2Byr9iEm919lL2Ua8Aw7NsUFb-bEFp_oi0pZt-M4TEt1ue5sv8YpeUYQa9O9KXozpNoJ7F5MV4SAB2OOD72prCWpWX8eHFGmsNBkibUUGrTN-xZABEfnR-HEZMVo58P_NjvG61pEnMvEcUcakJ2Y1KOdh0sapjD9BjnJdqjguDzXA"
-	// Generate unique request ID
-	requestID := fmt.Sprintf("%d", time.Now().UnixNano())
-	// Create proxy request message
-	proxyMsg := Message{
-		Type: "proxy_request",
-		Payload: ProxyRequest{
-			RequestID: requestID,
-			Method:    r.Method,
-			Path:      r.URL.Path,
-			Headers:   headers,
-			Body:      string(body),
-		},
-	}
 
-	// Create response channel
-	responseChan := make(chan ProxyResponse, 1)
+	// Add body
+	httpMsg += "\r\n" + string(body)
 
-	// Register response channel
-	s.mutex.Lock()
-	if client.ResponseChannels == nil {
-		client.ResponseChannels = make(map[string]chan ProxyResponse)
-	}
-	client.ResponseChannels[requestID] = responseChan
-	s.mutex.Unlock()
-
-	// Cleanup function
-	defer func() {
-		s.mutex.Lock()
-		delete(client.ResponseChannels, requestID)
-		s.mutex.Unlock()
-	}()
-
-	// Send to client
-	data, err := json.Marshal(proxyMsg)
-	if err != nil {
-		log.Printf("❌ Failed to marshal proxy message: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	// Send with configurable timeout
-	client.Conn.SetWriteDeadline(time.Now().Add(s.config.WriteTimeout))
-	if err := client.Conn.WriteMessage(websocket.TextMessage, data); err != nil {
-		log.Printf("❌ Failed to send proxy message: %v", err)
+	// Send via TCP tunnel to client
+	if _, err := client.TCPConn.Write([]byte(httpMsg)); err != nil {
+		log.Printf("❌ Failed to send HTTP request to client: %v", err)
 		http.Error(w, "Failed to forward request", http.StatusBadGateway)
 		return
 	}
 
-	// Wait for response with timeout
-	select {
-	case response := <-responseChan:
-		// Write response headers
-		for key, value := range response.Headers {
-			w.Header().Set(key, value)
-		}
+	// For now, just send a simple response
+	// In a real implementation, you'd wait for the client's response
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(fmt.Sprintf("Request forwarded to client %s via TCP tunnel", client.ID)))
 
-		// Write status code
-		w.WriteHeader(response.StatusCode)
+	log.Printf("✅ HTTP request forwarded to client %s", client.ID)
+}
 
-		// Write body
-		w.Write([]byte(response.Body))
+// getActiveConnections returns the number of active user connections for a client
+func (s *Server) getActiveConnections(client *Client) int {
+	client.tunnelMutex.RLock()
+	defer client.tunnelMutex.RUnlock()
+	return len(client.userConnections)
+}
 
-		log.Printf("✅ Proxy response sent: %d bytes", len(response.Body))
+// getTotalActiveConnections returns the total number of active connections across all clients
+func (s *Server) getTotalActiveConnections() int {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
 
-	case <-time.After(30 * time.Second):
-		log.Printf("❌ Proxy request timeout for %s", client.ID)
-		http.Error(w, "Request timeout", http.StatusGatewayTimeout)
-		return
+	total := 0
+	for _, client := range s.clients {
+		total += s.getActiveConnections(client)
 	}
-
-	// Update client stats
-	s.mutex.Lock()
-	client.Requests++
-	client.BytesIn += int64(len(body))
-	client.BytesOut += int64(len(data))
-	s.mutex.Unlock()
+	return total
 }
 
 // HandleListClients returns a list of connected clients
 func (s *Server) HandleListClients(w http.ResponseWriter, r *http.Request) {
-	// Check authentication if configured
-	if s.config.Username != "" && s.config.Password != "" {
-		user, pass, ok := r.BasicAuth()
-		if !ok || user != s.config.Username || pass != s.config.Password {
-			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
-	}
-
 	s.mutex.RLock()
 	clientList := make([]map[string]interface{}, 0, len(s.clients))
 	for _, client := range s.clients {
+		activeConnections := s.getActiveConnections(client)
 		clientList = append(clientList, map[string]interface{}{
-			"id":        client.ID,
-			"url":       client.URL,
-			"connected": client.Connected,
-			"last_seen": client.LastSeen,
-			"requests":  client.Requests,
-			"bytes_in":  client.BytesIn,
-			"bytes_out": client.BytesOut,
+			"id":                 client.ID,
+			"connected":          client.Connected,
+			"last_seen":          client.LastSeen,
+			"requests":           client.Requests,
+			"bytes_in":           client.BytesIn,
+			"bytes_out":          client.BytesOut,
+			"active":             client.isActive,
+			"active_connections": activeConnections,
+			"subdomain":          client.ID + "." + s.config.Domain, // Add subdomain info
 		})
 	}
+	totalConnections := s.getTotalActiveConnections()
 	s.mutex.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"clients": clientList,
-		"count":   len(clientList),
-		"stats":   s.GetClientStats(),
+		"clients":           clientList,
+		"count":             len(clientList),
+		"total_connections": totalConnections,
 	})
-}
-
-// HandleKubectlWebSocket handles kubectl WebSocket requests (port-forward, exec, etc.)
-func (s *Server) HandleKubectlWebSocket(w http.ResponseWriter, r *http.Request, client *Client) {
-	log.Printf("🔌 Handling kubectl WebSocket request for client: %s", client.ID)
-
-	// Upgrade to WebSocket
-	wsConn, err := s.upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("❌ Failed to upgrade to WebSocket: %v", err)
-		return
-	}
-	defer wsConn.Close()
-
-	log.Printf("✅ WebSocket upgraded for kubectl request")
-
-	// Send tunnel request to client via WebSocket
-	tunnelMsg := Message{
-		Type: "tcp_tunnel",
-		Payload: TCPTunnelRequest{
-			Target: "nginx.default", // Default target, can be made configurable
-		},
-	}
-
-	data, err := json.Marshal(tunnelMsg)
-	if err != nil {
-		log.Printf("❌ Failed to marshal tunnel request: %v", err)
-		return
-	}
-
-	// Send to client via WebSocket
-	if err := client.writeMessage(websocket.TextMessage, data); err != nil {
-		log.Printf("❌ Failed to send tunnel request to client: %v", err)
-		return
-	}
-
-	log.Printf("📨 Tunnel request sent to client %s", client.ID)
-
-	// Handle WebSocket communication between kubectl and client
-	s.handleKubectlWebSocketStream(wsConn, client)
-}
-
-// handleKubectlWebSocketStream handles the WebSocket stream between kubectl and client
-func (s *Server) handleKubectlWebSocketStream(wsConn *websocket.Conn, client *Client) {
-	log.Printf("📡 Starting kubectl WebSocket stream for client: %s", client.ID)
-
-	// Create a channel to coordinate shutdown
-	done := make(chan bool)
-	defer close(done)
-
-	// Start kubectl to client data flow
-	go func() {
-		defer func() {
-			log.Printf("📤 kubectl to client stream ended")
-		}()
-
-		for {
-			select {
-			case <-done:
-				return
-			default:
-				// Read from kubectl WebSocket
-				messageType, message, err := wsConn.ReadMessage()
-				if err != nil {
-					if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-						log.Printf("❌ kubectl WebSocket read error: %v", err)
-					}
-					return
-				}
-
-				if messageType == websocket.BinaryMessage {
-					log.Printf("📤 Received %d bytes from kubectl", len(message))
-
-					// Forward to client via WebSocket
-					if err := client.writeMessage(websocket.BinaryMessage, message); err != nil {
-						log.Printf("❌ Failed to forward data to client: %v", err)
-						return
-					}
-
-					log.Printf("📤 Forwarded %d bytes from kubectl to client", len(message))
-				}
-			}
-		}
-	}()
-
-	// Keep connection alive
-	select {
-	case <-done:
-		return
-	}
 }
 
 // HandleStatus returns the server status page
 func (s *Server) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	s.mutex.RLock()
 	clientCount := len(s.clients)
-	clientList := make([]map[string]string, 0, len(s.clients))
+	activeClients := 0
+	totalConnections := s.getTotalActiveConnections()
+
+	// Count active clients
 	for _, client := range s.clients {
-		clientList = append(clientList, map[string]string{
-			"id":  client.ID,
-			"url": client.URL,
+		if client.isActive {
+			activeClients++
+		}
+	}
+
+	// Get detailed client info for the table
+	clientDetails := make([]map[string]interface{}, 0, len(s.clients))
+	for _, client := range s.clients {
+		activeConnections := s.getActiveConnections(client)
+		clientDetails = append(clientDetails, map[string]interface{}{
+			"id":                 client.ID,
+			"active":             client.isActive,
+			"connected":          client.Connected.Format("15:04:05"),
+			"active_connections": activeConnections,
+			"subdomain":          client.ID + "." + s.config.Domain,
 		})
 	}
 	s.mutex.RUnlock()
@@ -606,61 +572,134 @@ func (s *Server) HandleStatus(w http.ResponseWriter, r *http.Request) {
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Reverse Proxy Server</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TCP Tunnel Server</title>
     <style>
         body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
-        .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        .status { padding: 20px; background: #e8f4f8; border-radius: 5px; margin: 20px 0; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .status { background: #d4edda; padding: 15px; border-radius: 5px; margin: 20px 0; border-left: 5px solid #28a745; }
         .connected { color: #28a745; font-weight: bold; }
-        .disconnected { color: #dc3545; }
-        .client { margin: 10px 0; padding: 15px; background: #f8f9fa; border-radius: 5px; border-left: 4px solid #007bff; }
-        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 20px 0; }
-        .stat-card { background: #f8f9fa; padding: 15px; border-radius: 5px; text-align: center; }
+        .stats { display: flex; flex-wrap: wrap; gap: 20px; margin: 20px 0; }
+        .stat-card { background: #f8f9fa; padding: 20px; border-radius: 8px; min-width: 150px; text-align: center; }
         .stat-number { font-size: 2em; font-weight: bold; color: #007bff; }
         .stat-label { color: #6c757d; font-size: 0.9em; }
+        .subdomain { background: #e3f2fd; padding: 10px; border-radius: 5px; margin: 10px 0; }
+        .client-table { width: 100%%; border-collapse: collapse; margin: 20px 0; }
+        .client-table th, .client-table td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        .client-table th { background-color: #f8f9fa; font-weight: bold; }
+        .status-active { color: #28a745; font-weight: bold; }
+        .status-inactive { color: #dc3545; font-weight: bold; }
+        .connections-badge { background: #007bff; color: white; padding: 4px 8px; border-radius: 12px; font-size: 0.8em; }
+        .client { margin: 10px 0; padding: 15px; background: #f8f9fa; border-radius: 5px; border-left: 4px solid #007bff; }
     </style>
+    <script>
+        function refreshPage() {
+            location.reload();
+        }
+        // Auto-refresh every 5 seconds
+        setInterval(refreshPage, 5000);
+    </script>
 </head>
 <body>
     <div class="container">
-        <h1> Reverse Proxy Server</h1>
+        <h1>🔌 TCP Tunnel Server</h1>
         <div class="status">
-            <h2>Status: <span class="connected">Running</span></h2>
-            <p>Connected clients: <strong>%d</strong></p>
+            <h2>Status: <span class="connected">Running</span> <small>(Auto-refresh: 5s)</small></h2>
             <p><a href="/clients">View Clients (JSON)</a></p>
         </div>
         
         <div class="stats">
             <div class="stat-card">
                 <div class="stat-number">%d</div>
-                <div class="stat-label">Connected Clients</div>
+                <div class="stat-label">Total Clients</div>
             </div>
             <div class="stat-card">
                 <div class="stat-number">%d</div>
-                <div class="stat-label">Max Clients</div>
+                <div class="stat-label">Active Clients</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number">%d</div>
+                <div class="stat-label">Active Connections</div>
             </div>
             <div class="stat-card">
                 <div class="stat-number">%s</div>
-                <div class="stat-label">Domain</div>
+                <div class="stat-label">TCP Port</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number">%s</div>
+                <div class="stat-label">HTTP Port</div>
             </div>
         </div>
         
-        <h3>Connected Clients:</h3>
-        <div class="clients">`, clientCount, clientCount, s.config.MaxClients, s.config.Domain)
+        <h3>📊 Connected Clients:</h3>
+        <table class="client-table">
+            <thead>
+                <tr>
+                    <th>Client ID</th>
+                    <th>Status</th>
+                    <th>Connected At</th>
+                    <th>Active Connections</th>
+                    <th>Subdomain</th>
+                </tr>
+            </thead>
+            <tbody>`, clientCount, activeClients, totalConnections, s.config.TCPPort, s.config.Port)
 
-	for _, client := range clientList {
+	// Add client rows
+	for _, client := range clientDetails {
+		statusClass := "status-inactive"
+		statusText := "Inactive"
+		if client["active"].(bool) {
+			statusClass = "status-active"
+			statusText = "Active"
+		}
+
+		connectionsText := ""
+		if client["active_connections"].(int) > 0 {
+			connectionsText = fmt.Sprintf(`<span class="connections-badge">%d</span>`, client["active_connections"].(int))
+		} else {
+			connectionsText = "0"
+		}
+
 		html += fmt.Sprintf(`
-            <div class="client">
-                <strong>%s</strong> - <a href="%s" target="_blank">%s</a>
-            </div>`, client["id"], client["url"], client["url"])
+                <tr>
+                    <td><strong>%s</strong></td>
+                    <td><span class="%s">%s</span></td>
+                    <td>%s</td>
+                    <td>%s</td>
+                    <td><code>%s</code></td>
+                </tr>`,
+			client["id"].(string),
+			statusClass,
+			statusText,
+			client["connected"].(string),
+			connectionsText,
+			client["subdomain"].(string))
 	}
 
 	html += `
+            </tbody>
+        </table>
+        
+        <h3>🌐 Subdomain Routing:</h3>
+        <div class="subdomain">
+            <strong>How to use:</strong><br>
+            &bull; <code>client1.` + s.config.Domain + `</code> &rarr; Routes to client1<br>
+            &bull; <code>client2.` + s.config.Domain + `</code> &rarr; Routes to client2<br>
+            &bull; <code>` + s.config.Domain + `</code> &rarr; Shows this status page
+        </div>
+        
+        <h3>💡 Example Usage:</h3>
+        <div class="client">
+            <strong>SSH to client1:</strong> <code>ssh -p ` + s.config.TCPPort + ` client1.` + s.config.Domain + `</code><br>
+            <strong>HTTP to client2:</strong> <code>curl http://client2.` + s.config.Domain + `:` + s.config.Port + `/api</code><br>
+            <strong>Multiple curls:</strong> <code>for i in {1..100}; do curl http://client1.` + s.config.Domain + `:` + s.config.Port + `/ & done</code>
         </div>
     </div>
 </body>
 </html>`
 
-	w.Header().Set("Content-Type", "text/html")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, err := w.Write([]byte(html))
 	if err != nil {
 		return
