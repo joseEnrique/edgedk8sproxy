@@ -22,6 +22,8 @@ server/server
 client/client
 bin/
 dist/
+certs/
+certs/*
 
 # Environment files
 .env

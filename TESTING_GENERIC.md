@@ -7,7 +7,7 @@
 Usuario → Servidor (Puerto 8081) → Cliente → FORWARD_HOST:FORWARD_PORT
 ```
 
-**El servidor NO detecta protocolos, solo reenvía TODO el tráfico TCP al cliente.**
+**El servidor NO detecta protocolos, solo reenvía TODO el tráfico TCP al agente.**
 
 ## **🚀 Quick Start**
 
@@ -22,31 +22,31 @@ go build -o server .
 ```
 🚀 Starting HTTP server on port 8080
 📊 Status endpoint: http://localhost:8080/status
-👥 Clients endpoint: http://localhost:8080/clients
-🌐 Subdomain routing: client1.localhost, client2.localhost, etc.
-🔌 TCP tunnel server will listen for client connections
+👥 Clients endpoint: http://localhost:8080/agents
+🌐 Subdomain routing: agent1.localhost, agent2.localhost, etc.
+🔌 TCP tunnel server will listen for agent connections
 🔌 TCP tunnel server listening on port 8081
 ```
 
 ### **2. Start Client**
 ```bash
-cd client
-export CLIENT_ID=client1
+cd agent
+export AGENT_ID=agent1
 export FORWARD_HOST=192.168.1.2
 export FORWARD_PORT=6443
-go build -o client .
-./client
+go build -o agent .
+./agent
 ```
 
 **Expected output:**
 ```
-🚀 Starting TCP tunnel client
+🚀 Starting TCP tunnel agent
 🔌 Connecting to server: localhost:8081
-🆔 Client ID: client1
+🆔 Client ID: agent1
 🎯 Forwarding all traffic to: 192.168.1.2:6443
 ✅ Connected to server localhost:8081
 📡 Starting TCP tunnel
-✅ Client identification sent: client1
+✅ Client identification sent: agent1
 📡 TCP tunnel active
 ```
 
@@ -57,7 +57,7 @@ go build -o client .
 # Conectar SSH directamente al puerto 8081
 ssh -p 8081 localhost
 
-# Expected: SSH traffic forwarded to client, then to FORWARD_HOST:FORWARD_PORT
+# Expected: SSH traffic forwarded to agent, then to FORWARD_HOST:FORWARD_PORT
 ```
 
 ### **B. HTTP Test (Puerto 8081)**
@@ -65,7 +65,7 @@ ssh -p 8081 localhost
 # Conectar HTTP directamente al puerto 8081
 curl -v telnet://localhost:8081
 
-# Expected: HTTP traffic forwarded to client, then to FORWARD_HOST:FORWARD_PORT
+# Expected: HTTP traffic forwarded to agent, then to FORWARD_HOST:FORWARD_PORT
 ```
 
 ### **C. kubectl Test (Puerto 8081)**
@@ -73,7 +73,7 @@ curl -v telnet://localhost:8081
 # Conectar kubectl directamente al puerto 8081
 kubectl port-forward pod/nginx 8081:80
 
-# Expected: kubectl traffic forwarded to client, then to FORWARD_HOST:FORWARD_PORT
+# Expected: kubectl traffic forwarded to agent, then to FORWARD_HOST:FORWARD_PORT
 ```
 
 ### **D. Any TCP Test (Puerto 8081)**
@@ -81,7 +81,7 @@ kubectl port-forward pod/nginx 8081:80
 # Enviar cualquier dato TCP
 echo "Hello World" | nc localhost 8081
 
-# Expected: All TCP traffic forwarded to client, then to FORWARD_HOST:FORWARD_PORT
+# Expected: All TCP traffic forwarded to agent, then to FORWARD_HOST:FORWARD_PORT
 ```
 
 ## **🔍 What to Look For**
@@ -89,18 +89,18 @@ echo "Hello World" | nc localhost 8081
 ### **Server Logs:**
 ```
 🔌 TCP connection accepted from 127.0.0.1:xxxxx
-📡 User traffic detected, forwarding to client
+📡 User traffic detected, forwarding to agent
 📡 Handling user traffic (X bytes)
-✅ Routing user traffic to client: client1
-📡 Starting bidirectional forwarding between user and client client1
-📤 Forwarding X bytes from user to client client1
-📥 Forwarding X bytes from client client1 to user
+✅ Routing user traffic to agent: agent1
+📡 Starting bidirectional forwarding between user and agent agent1
+📤 Forwarding X bytes from user to agent agent1
+📥 Forwarding X bytes from agent agent1 to user
 ```
 
 ### **Client Logs:**
 ```
 ✅ Connected to server localhost:8081
-✅ Client identification sent: client1
+✅ Client identification sent: agent1
 📡 TCP tunnel active
 📤 Received X bytes from server
 📤 Forwarding X bytes to target 192.168.1.2:6443
@@ -116,7 +116,7 @@ echo "Hello World" | nc localhost 8081
 # Conexión al servidor
 SERVER_HOST=localhost
 SERVER_PORT=8081
-CLIENT_ID=client1
+AGENT_ID=agent1
 
 # Target único para TODO el tráfico
 FORWARD_HOST=192.168.1.2    # IP del target
@@ -127,15 +127,15 @@ FORWARD_PORT=6443           # Puerto del target
 
 ### **1. Cliente se conecta:**
 - Cliente se conecta al puerto 8081
-- Envía su ID (ej: "client1")
-- Servidor lo registra como cliente activo
+- Envía su ID (ej: "agent1")
+- Servidor lo registra como agente activo
 
 ### **2. Usuario se conecta:**
 - Usuario se conecta al puerto 8081
-- Servidor detecta que NO es un cliente (no envía ID)
+- Servidor detecta que NO es un agente (no envía ID)
 - Servidor lo trata como "user traffic"
-- Servidor encuentra un cliente disponible
-- Servidor reenvía TODO el tráfico al cliente
+- Servidor encuentra un agente disponible
+- Servidor reenvía TODO el tráfico al agente
 
 ### **3. Cliente reenvía:**
 - Cliente recibe tráfico del servidor
@@ -185,11 +185,11 @@ export FORWARD_PORT=80
 
 ### **Client not receiving traffic:**
 ```bash
-# Check if client is connected
-curl http://localhost:8080/clients
+# Check if agent is connected
+curl http://localhost:8080/agents
 
 # Check server logs for "User traffic detected"
-# Check client logs for "Received X bytes from server"
+# Check agent logs for "Received X bytes from server"
 ```
 
 ### **No response from target:**
@@ -197,7 +197,7 @@ curl http://localhost:8080/clients
 # Check if target is reachable
 nc -z 192.168.1.2 6443
 
-# Check client logs for target connection
+# Check agent logs for target connection
 # Verify FORWARD_HOST and FORWARD_PORT
 ```
 
@@ -206,7 +206,7 @@ nc -z 192.168.1.2 6443
 - ✅ **Cliente inicia** conexión TCP al servidor
 - ✅ **Servidor mantiene** tunnel abierto
 - ✅ **Usuario se conecta** al puerto 8081
-- ✅ **Servidor reenvía TODO** al cliente (sin detectar protocolo)
+- ✅ **Servidor reenvía TODO** al agente (sin detectar protocolo)
 - ✅ **Cliente reenvía TODO** a FORWARD_HOST:FORWARD_PORT
 - ✅ **Funciona con cualquier protocolo** (SSH, HTTP, kubectl, etc.)
 

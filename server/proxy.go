@@ -1,15 +1,21 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 // StartTCPTunnelServer starts the TCP tunnel server for client connections
@@ -36,7 +42,189 @@ func (s *Server) StartTCPTunnelServer() {
 	}
 }
 
-// handleTCPConnection handles incoming TCP connections and determines if they are clients or users
+// StartH2TLSServer starts an HTTP/2 TLS server requiring client certs (mTLS)
+func (s *Server) StartH2TLSServer() {
+	if s.config.TLSCertFile == "" || s.config.TLSKeyFile == "" || s.config.TLSClientCA == "" {
+		log.Printf("❌ H2 TLS config missing (TLS_CERT_FILE/TLS_KEY_FILE/TLS_CLIENT_CA_FILE)")
+		return
+	}
+
+	// Load server cert
+	cert, err := tls.LoadX509KeyPair(s.config.TLSCertFile, s.config.TLSKeyFile)
+	if err != nil {
+		log.Printf("❌ Failed to load server cert/key: %v", err)
+		return
+	}
+
+	// Load client CA
+	caCert, err := os.ReadFile(s.config.TLSClientCA)
+	if err != nil {
+		log.Printf("❌ Failed to read client CA: %v", err)
+		return
+	}
+	caPool := x509.NewCertPool()
+	caPool.AppendCertsFromPEM(caCert)
+
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientCAs:    caPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"h2", "http/1.1"},
+	}
+
+	srv := &http.Server{
+		Addr:      ":" + s.config.H2Port,
+		TLSConfig: tlsCfg,
+		Handler:   http.HandlerFunc(s.handleH2Tunnel),
+	}
+	// Configure HTTP/2 parameters
+	http2.ConfigureServer(srv, &http2.Server{
+		MaxConcurrentStreams: 1024,
+		ReadIdleTimeout:      30 * time.Second,
+		PingTimeout:          15 * time.Second,
+	})
+
+	log.Printf("🔐 Starting HTTP/2 mTLS tunnel server on %s", s.config.H2Port)
+	if err := srv.ListenAndServeTLS("", ""); err != nil {
+		log.Printf("❌ H2 TLS server failed: %v", err)
+	}
+}
+
+// handleH2Tunnel handles HTTP/2 streams as tunnel carriers
+func (s *Server) handleH2Tunnel(w http.ResponseWriter, r *http.Request) {
+	// Expect path /tunnel and method POST for streams
+	if r.Method != http.MethodPost || r.URL.Path != "/tunnel" {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("not found"))
+		return
+	}
+	agentID := r.Header.Get("X-Agent-ID")
+	if agentID == "" {
+		agentID = "agent1"
+	}
+
+	// ALWAYS use multiplexed mode
+	s.handleMultiplexedTunnel(w, r, agentID)
+}
+
+func (s *Server) forwardUserToAgentH2(userConn net.Conn, agent *Agent, initialData []byte) {
+	defer userConn.Close()
+
+	// Wait for an available stream with timeout
+	var h2 *H2Stream
+	select {
+	case h2 = <-agent.h2Streams:
+		log.Printf("✅ Got H2 stream %s for user %s", h2.id, userConn.RemoteAddr())
+	case <-time.After(10 * time.Second):
+		log.Printf("❌ Timeout waiting for H2 stream for user %s", userConn.RemoteAddr())
+		return
+	}
+
+	done := make(chan struct{})
+	var once sync.Once
+	closeDone := func() {
+		once.Do(func() {
+			close(done)
+			h2.Close()
+		})
+	}
+	defer closeDone()
+
+	// Send initial data first if available
+	if len(initialData) > 0 {
+		log.Printf("📤 Sending initial data (%d bytes) to agent via H2 stream %s", len(initialData), h2.id)
+		if _, err := h2.writeStream.Write(initialData); err != nil {
+			log.Printf("❌ Failed to write initial data to H2 stream: %v", err)
+			return
+		}
+	}
+
+	var wg sync.WaitGroup
+
+	// agent->user: read from h2.readStream (agent sends data via HTTP request body)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer func() {
+			log.Printf("📥 Agent->User stream ended for %s", userConn.RemoteAddr())
+		}()
+
+		buffer := make([]byte, 32*1024)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				n, err := h2.readStream.Read(buffer)
+				if n > 0 {
+					if _, writeErr := userConn.Write(buffer[:n]); writeErr != nil {
+						log.Printf("⚠️ Error writing to user connection: %v", writeErr)
+						closeDone()
+						return
+					}
+				}
+				if err != nil {
+					if err == io.EOF {
+						closeDone()
+						return
+					}
+					log.Printf("⚠️ Error reading from H2 readStream: %v", err)
+					closeDone()
+					return
+				}
+			}
+		}
+	}()
+
+	// user->agent: write to h2.writeStream (server sends data via HTTP response body)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer func() {
+			log.Printf("📤 User->Agent stream ended for %s", userConn.RemoteAddr())
+		}()
+
+		buffer := make([]byte, 32*1024)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				// Set read timeout for user connection
+				userConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+				n, err := userConn.Read(buffer)
+				if n > 0 {
+					if _, writeErr := h2.writeStream.Write(buffer[:n]); writeErr != nil {
+						log.Printf("⚠️ Error writing to H2 writeStream: %v", writeErr)
+						closeDone()
+						return
+					}
+				}
+				if err != nil {
+					if err == io.EOF {
+						closeDone()
+						return
+					}
+					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+						// Timeout is normal, continue
+						continue
+					}
+					log.Printf("⚠️ Error reading from user connection: %v", err)
+					closeDone()
+					return
+				}
+			}
+		}
+	}()
+
+	// Wait for either direction to finish
+	wg.Wait()
+	log.Printf("🔄 H2 bridge completed for user %s via stream %s", userConn.RemoteAddr(), h2.id)
+}
+
+// handleTCPConnection handles incoming TCP connections and determines if they are agents or users
 func (s *Server) handleTCPConnection(conn net.Conn) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		_ = tcpConn.SetNoDelay(true)
@@ -63,55 +251,96 @@ func (s *Server) handleTCPConnection(conn net.Conn) {
 
 	data := buffer[:n]
 	if n > 0 && n < 50 && !strings.Contains(string(data), "SSH-") && !strings.Contains(string(data), "HTTP") {
-		log.Printf("🔌 Client connection detected")
-		s.handleTCPClientConnection(conn, string(data))
+		log.Printf("🔌 Agent connection detected")
+		s.handleTCPAgentConnection(conn, string(data))
 		return
 	}
-	log.Printf("📡 User traffic detected, forwarding to client")
+	log.Printf("📡 User traffic detected, forwarding to agent")
 	s.handleUserTraffic(conn, data)
 }
 
-// handleUserTraffic handles user traffic (SSH, HTTP, kubectl, etc.) and forwards it to a client
+// handleUserTraffic handles user traffic (SSH, HTTP, kubectl, etc.) and forwards it to an agent
 func (s *Server) handleUserTraffic(conn net.Conn, initialData []byte) {
 	log.Printf("📡 Handling user traffic (%d bytes)", len(initialData))
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		_ = tcpConn.SetNoDelay(true)
 	}
 
-	clientID := "client1"
-
-	s.mutex.RLock()
-	client, exists := s.clients[clientID]
-	s.mutex.RUnlock()
-
-	if !exists {
-		log.Printf("❌ Client %s not found", clientID)
+	agent := s.selectAgentForInitialData(initialData)
+	if agent == nil {
+		log.Printf("❌ No matching agent for initial data; rejecting")
 		_ = conn.Close()
 		return
 	}
 
-	log.Printf("✅ Routing user traffic to client: %s", client.ID)
+	log.Printf("✅ Routing user traffic to MULTIPLEXED agent: %s", agent.ID)
 
-	// Send initial data to client first
-	if len(initialData) > 0 {
-		log.Printf("📤 Sending initial %d bytes to client", len(initialData))
-		if _, err := client.TCPConn.Write(initialData); err != nil {
-			log.Printf("❌ Failed to send initial data to client: %v", err)
-			_ = conn.Close()
-			return
-		}
-		log.Printf("✅ Initial data sent to client")
-	}
-
-	// Start a new user session for this connection (concurrent)
-	go s.forwardUserToClient(conn, client)
+	// ALWAYS use multiplexed tunnel
+	go s.forwardUserToMuxAgent(conn, agent, initialData)
 }
 
-// forwardUserToClient handles bidirectional forwarding between user connection and client
-func (s *Server) forwardUserToClient(userConn net.Conn, client *Client) {
+// forwardUserToMuxAgent forwards user connection via multiplexed tunnel
+func (s *Server) forwardUserToMuxAgent(userConn net.Conn, agent *Agent, initialData []byte) {
 	defer userConn.Close()
 
-	log.Printf("📡 Starting direct TCP forwarding for client %s", client.ID)
+	// Check if agent has THE ONLY multiplexed manager
+	if agent.multiplexedManager == nil {
+		log.Printf("❌ Agent %s has no multiplexed manager", agent.ID)
+		return
+	}
+
+	mux := agent.multiplexedManager
+
+	// Create new multiplexed connection
+	connID := s.createMuxConnection(mux, userConn)
+
+	// Send initial data as first frame if any
+	if len(initialData) > 0 {
+		// Send frame to agent: [conn_id(4)] + [length(4)] + [data]
+		frame := make([]byte, 8+len(initialData))
+
+		// Write connection ID (big-endian)
+		frame[0] = byte(connID >> 24)
+		frame[1] = byte(connID >> 16)
+		frame[2] = byte(connID >> 8)
+		frame[3] = byte(connID)
+
+		// Write data length (big-endian)
+		dataLen := uint32(len(initialData))
+		frame[4] = byte(dataLen >> 24)
+		frame[5] = byte(dataLen >> 16)
+		frame[6] = byte(dataLen >> 8)
+		frame[7] = byte(dataLen)
+
+		// Copy data
+		copy(frame[8:], initialData)
+
+		// Send frame to agent via non-blocking queue
+		select {
+		case mux.writeQueue <- frame:
+			// Frame queued successfully
+		case <-time.After(100 * time.Millisecond):
+			log.Printf("⚠️ Write queue full for initial frame conn %d", connID)
+			s.closeMuxConnection(mux, connID)
+			return
+		case <-mux.done:
+			s.closeMuxConnection(mux, connID)
+			return
+		}
+	}
+
+	log.Printf("🔗 User %s connected via multiplexed connection %d", userConn.RemoteAddr(), connID)
+
+	// The readFromUserToAgent goroutine handles the rest of the data transfer
+	// Wait for connection to close
+	<-mux.done
+}
+
+// forwardUserToAgent handles bidirectional forwarding between user connection and agent
+func (s *Server) forwardUserToAgent(userConn net.Conn, agent *Agent) {
+	defer userConn.Close()
+
+	log.Printf("📡 Starting direct TCP forwarding for agent %s", agent.ID)
 
 	// Create a done channel for this specific user session
 	done := make(chan struct{})
@@ -126,19 +355,19 @@ func (s *Server) forwardUserToClient(userConn net.Conn, client *Client) {
 	responseChan := make(chan []byte, 100)
 
 	// Register this user connection to receive responses
-	client.tunnelMutex.Lock()
-	if client.userConnections == nil {
-		client.userConnections = make(map[string]chan []byte)
+	agent.tunnelMutex.Lock()
+	if agent.userConnections == nil {
+		agent.userConnections = make(map[string]chan []byte)
 	}
 	userID := fmt.Sprintf("%s-%d", userConn.RemoteAddr().String(), time.Now().UnixNano())
-	client.userConnections[userID] = responseChan
-	client.tunnelMutex.Unlock()
+	agent.userConnections[userID] = responseChan
+	agent.tunnelMutex.Unlock()
 
 	// Clean up when this function exits
 	defer func() {
-		client.tunnelMutex.Lock()
-		delete(client.userConnections, userID)
-		client.tunnelMutex.Unlock()
+		agent.tunnelMutex.Lock()
+		delete(agent.userConnections, userID)
+		agent.tunnelMutex.Unlock()
 		close(responseChan)
 	}()
 
@@ -168,9 +397,9 @@ func (s *Server) forwardUserToClient(userConn net.Conn, client *Client) {
 
 				if n > 0 {
 					// Write to tunnel with mutex to prevent conflicts
-					client.writerMu.Lock()
-					if _, err := client.TCPConn.Write(buffer[:n]); err != nil {
-						client.writerMu.Unlock()
+					agent.writerMu.Lock()
+					if _, err := agent.TCPConn.Write(buffer[:n]); err != nil {
+						agent.writerMu.Unlock()
 						if isConnectionClosed(err) {
 							log.Printf("📤 Tunnel connection closed during write")
 							closeDone()
@@ -180,7 +409,7 @@ func (s *Server) forwardUserToClient(userConn net.Conn, client *Client) {
 						closeDone()
 						return
 					}
-					client.writerMu.Unlock()
+					agent.writerMu.Unlock()
 				}
 			}
 		}
@@ -217,7 +446,7 @@ func (s *Server) forwardUserToClient(userConn net.Conn, client *Client) {
 
 	// Wait for this user session to end (tunnel stays open FOREVER)
 	<-done
-	log.Printf("📡 User session ended for client %s (tunnel remains persistent)", client.ID)
+	log.Printf("📡 User session ended for agent %s (tunnel remains persistent)", agent.ID)
 }
 
 // isConnectionClosed checks if an error indicates a closed connection
@@ -229,15 +458,15 @@ func isConnectionClosed(err error) bool {
 	return es == "EOF" || strings.Contains(es, "use of closed network connection") || strings.Contains(es, "connection reset by peer") || strings.Contains(es, "broken pipe")
 }
 
-// handleTCPClientConnection handles a TCP connection from a client
-func (s *Server) handleTCPClientConnection(conn net.Conn, clientID string) {
-	log.Printf("🔌 Client %s connected via TCP tunnel", clientID)
+// handleTCPClientConnection handles a TCP connection from a agent
+func (s *Server) handleTCPAgentConnection(conn net.Conn, agentID string) {
+	log.Printf("🔌 Client %s connected via TCP tunnel", agentID)
 	if tcp, ok := conn.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
 	}
 
-	client := &Client{
-		ID:              clientID,
+	agent := &Agent{
+		ID:              agentID,
 		TCPConn:         conn,
 		Connected:       time.Now(),
 		LastSeen:        time.Now(),
@@ -249,44 +478,44 @@ func (s *Server) handleTCPClientConnection(conn net.Conn, clientID string) {
 	}
 
 	s.mutex.Lock()
-	s.clients[clientID] = client
+	s.agents[agentID] = agent
 	s.mutex.Unlock()
 
-	log.Printf("✅ Created new TCP client: %s", clientID)
+	log.Printf("✅ Created new TCP agent: %s", agentID)
 
 	// Start the central tunnel reader that distributes responses
-	go s.tunnelReader(client)
+	go s.tunnelReader(agent)
 
 	// Start TCP tunnel handling
-	s.handleTCPTunnel(conn, clientID)
+	s.handleTCPTunnel(conn, agentID)
 }
 
-// handleTCPTunnel handles the TCP tunnel between server and client
-func (s *Server) handleTCPTunnel(conn net.Conn, clientID string) {
-	log.Printf("🔌 Starting PERSISTENT TCP tunnel for client: %s", clientID)
+// handleTCPTunnel handles the TCP tunnel between server and agent
+func (s *Server) handleTCPTunnel(conn net.Conn, agentID string) {
+	log.Printf("🔌 Starting PERSISTENT TCP tunnel for agent: %s", agentID)
 
-	// Get client reference
+	// Get agent reference
 	s.mutex.RLock()
-	client, exists := s.clients[clientID]
+	agent, exists := s.agents[agentID]
 	s.mutex.RUnlock()
 
 	if !exists {
-		log.Printf("❌ Client %s not found during tunnel handling", clientID)
+		log.Printf("❌ Client %s not found during tunnel handling", agentID)
 		return
 	}
 
 	// Mark tunnel as active
-	client.tunnelMutex.Lock()
-	client.isActive = true
-	client.tunnelMutex.Unlock()
+	agent.tunnelMutex.Lock()
+	agent.isActive = true
+	agent.tunnelMutex.Unlock()
 
-	log.Printf("✅ TCP tunnel established successfully for client: %s", clientID)
+	log.Printf("✅ TCP tunnel established successfully for agent: %s", agentID)
 
 	// PERSISTENT TUNNEL: This connection NEVER closes
-	// Only close if the client sends FIN TCP or server shuts down
+	// Only close if the agent sends FIN TCP or server shuts down
 	// But we don't read from it here - tunnelReader handles all data
 
-	// Just wait for the connection to be closed by client
+	// Just wait for the connection to be closed by agent
 	// We can detect this by checking if the connection is still alive
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -296,7 +525,7 @@ func (s *Server) handleTCPTunnel(conn net.Conn, clientID string) {
 		case <-ticker.C:
 			// Check if connection is still alive without reading data
 			if err := conn.SetReadDeadline(time.Now().Add(1 * time.Millisecond)); err != nil {
-				log.Printf("🔌 Tunnel connection lost for client %s", clientID)
+				log.Printf("🔌 Tunnel connection lost for agent %s", agentID)
 				goto cleanup
 			}
 
@@ -309,42 +538,42 @@ func (s *Server) handleTCPTunnel(conn net.Conn, clientID string) {
 					continue
 				}
 				// Connection is dead
-				log.Printf("🔌 Tunnel connection lost for client %s: %v", clientID, err)
+				log.Printf("🔌 Tunnel connection lost for agent %s: %v", agentID, err)
 				goto cleanup
 			}
 
 			// Reset deadline
 			conn.SetReadDeadline(time.Time{})
 
-		case <-client.done:
-			log.Printf("🔌 Client %s requested tunnel closure", clientID)
+		case <-agent.done:
+			log.Printf("🔌 Client %s requested tunnel closure", agentID)
 			goto cleanup
 		}
 	}
 
 cleanup:
-	// Clean up when tunnel is closed by client
-	log.Printf("🔌 TCP tunnel ended for client: %s", clientID)
-	client.tunnelMutex.Lock()
-	client.isActive = false
-	client.tunnelMutex.Unlock()
+	// Clean up when tunnel is closed by agent
+	log.Printf("🔌 TCP tunnel ended for agent: %s", agentID)
+	agent.tunnelMutex.Lock()
+	agent.isActive = false
+	agent.tunnelMutex.Unlock()
 
 	s.mutex.Lock()
-	delete(s.clients, clientID)
+	delete(s.agents, agentID)
 	s.mutex.Unlock()
 
 	conn.Close()
 }
 
 // tunnelReader is the central reader that distributes responses to user connections
-func (s *Server) tunnelReader(client *Client) {
+func (s *Server) tunnelReader(agent *Agent) {
 	defer func() {
-		log.Printf("🔌 Tunnel reader ended for client %s", client.ID)
+		log.Printf("🔌 Tunnel reader ended for agent %s", agent.ID)
 	}()
 
 	buffer := make([]byte, 32*1024)
 	for {
-		n, err := client.TCPConn.Read(buffer)
+		n, err := agent.TCPConn.Read(buffer)
 		if err != nil {
 			if isConnectionClosed(err) {
 				log.Printf("🔌 Tunnel connection closed")
@@ -363,8 +592,8 @@ func (s *Server) tunnelReader(client *Client) {
 			data := buffer[:n]
 
 			// This is raw response data, send to all user connections
-			client.tunnelMutex.RLock()
-			for userID, responseQueue := range client.userConnections {
+			agent.tunnelMutex.RLock()
+			for userID, responseQueue := range agent.userConnections {
 				select {
 				case responseQueue <- data:
 					// Response queued successfully
@@ -373,24 +602,9 @@ func (s *Server) tunnelReader(client *Client) {
 					log.Printf("⚠️ Response queue full for user %s, dropping response", userID)
 				}
 			}
-			client.tunnelMutex.RUnlock()
+			agent.tunnelMutex.RUnlock()
 		}
 	}
-}
-
-// processTCPData processes data received from TCP client
-func (s *Server) processTCPData(client *Client, data []byte) {
-	log.Printf("📦 Processing %d bytes from TCP client %s", len(data), client.ID)
-
-	// The client is sending data from the target back to the server
-	// This data should be forwarded to the user connection, not echoed back
-	// We don't need to process it, just log it for debugging
-
-	log.Printf("📥 Received %d bytes from client %s (target response)", len(data), client.ID)
-
-	// Note: This data should be automatically forwarded to the user connection
-	// by the bidirectional forwarding logic in forwardUserToClient
-	// We don't need to do anything here
 }
 
 // HandleRoot handles the root endpoint and routes requests based on subdomain
@@ -409,51 +623,51 @@ func (s *Server) HandleRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Find client by subdomain
-	client := s.GetClientBySubdomain(subdomain)
-	if client == nil {
+	// Find agent by subdomain
+	agent := s.GetAgentBySubdomain(subdomain)
+	if agent == nil {
 		http.Error(w, fmt.Sprintf("Client '%s' not found", subdomain), http.StatusNotFound)
 		return
 	}
 
-	log.Printf("🌐 Routing request for subdomain '%s' to client '%s'", subdomain, client.ID)
+	log.Printf("🌐 Routing request for subdomain '%s' to agent '%s'", subdomain, agent.ID)
 
-	// Forward the request to the client via TCP tunnel
-	s.forwardHTTPRequestToClient(w, r, client)
+	// Forward the request to the agent via TCP tunnel
+	s.forwardHTTPRequestToAgent(w, r, agent)
 }
 
-// GetClientBySubdomain finds a client by subdomain
-func (s *Server) GetClientBySubdomain(subdomain string) *Client {
+// GetClientBySubdomain finds a agent by subdomain
+func (s *Server) GetAgentBySubdomain(subdomain string) *Agent {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 
 	// Look for exact match first
-	if client, exists := s.clients[subdomain]; exists {
-		return client
+	if agent, exists := s.agents[subdomain]; exists {
+		return agent
 	}
 
-	// If no exact match, look for clients that start with the subdomain
-	for clientID, client := range s.clients {
-		if strings.HasPrefix(clientID, subdomain) {
-			return client
+	// If no exact match, look for agents that start with the subdomain
+	for agentID, agent := range s.agents {
+		if strings.HasPrefix(agentID, subdomain) {
+			return agent
 		}
 	}
 
 	return nil
 }
 
-// forwardHTTPRequestToClient forwards HTTP requests to a specific client via TCP tunnel
-func (s *Server) forwardHTTPRequestToClient(w http.ResponseWriter, r *http.Request, client *Client) {
-	log.Printf("📡 Forwarding HTTP request to client %s: %s %s", client.ID, r.Method, r.URL.Path)
+// forwardHTTPRequestToClient forwards HTTP requests to a specific agent via TCP tunnel
+func (s *Server) forwardHTTPRequestToAgent(w http.ResponseWriter, r *http.Request, agent *Agent) {
+	log.Printf("📡 Forwarding HTTP request to agent %s: %s %s", agent.ID, r.Method, r.URL.Path)
 
-	// Check if client is active
-	client.tunnelMutex.RLock()
-	if !client.isActive {
-		client.tunnelMutex.RUnlock()
+	// Check if agent is active
+	agent.tunnelMutex.RLock()
+	if !agent.isActive {
+		agent.tunnelMutex.RUnlock()
 		http.Error(w, "Client not active", http.StatusServiceUnavailable)
 		return
 	}
-	client.tunnelMutex.RUnlock()
+	agent.tunnelMutex.RUnlock()
 
 	// Read request body
 	body, err := io.ReadAll(r.Body)
@@ -476,57 +690,57 @@ func (s *Server) forwardHTTPRequestToClient(w http.ResponseWriter, r *http.Reque
 	// Add body
 	httpMsg += "\r\n" + string(body)
 
-	// Send via TCP tunnel to client
-	if _, err := client.TCPConn.Write([]byte(httpMsg)); err != nil {
-		log.Printf("❌ Failed to send HTTP request to client: %v", err)
+	// Send via TCP tunnel to agent
+	if _, err := agent.TCPConn.Write([]byte(httpMsg)); err != nil {
+		log.Printf("❌ Failed to send HTTP request to agent: %v", err)
 		http.Error(w, "Failed to forward request", http.StatusBadGateway)
 		return
 	}
 
 	// For now, just send a simple response
-	// In a real implementation, you'd wait for the client's response
+	// In a real implementation, you'd wait for the agent's response
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(fmt.Sprintf("Request forwarded to client %s via TCP tunnel", client.ID)))
+	w.Write([]byte(fmt.Sprintf("Request forwarded to agent %s via TCP tunnel", agent.ID)))
 
-	log.Printf("✅ HTTP request forwarded to client %s", client.ID)
+	log.Printf("✅ HTTP request forwarded to agent %s", agent.ID)
 }
 
-// getActiveConnections returns the number of active user connections for a client
-func (s *Server) getActiveConnections(client *Client) int {
-	client.tunnelMutex.RLock()
-	defer client.tunnelMutex.RUnlock()
-	return len(client.userConnections)
+// getActiveConnections returns the number of active user connections for a agent
+func (s *Server) getActiveConnections(agent *Agent) int {
+	agent.tunnelMutex.RLock()
+	defer agent.tunnelMutex.RUnlock()
+	return len(agent.userConnections)
 }
 
-// getTotalActiveConnections returns the total number of active connections across all clients
+// getTotalActiveConnections returns the total number of active connections across all agents
 func (s *Server) getTotalActiveConnections() int {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 
 	total := 0
-	for _, client := range s.clients {
-		total += s.getActiveConnections(client)
+	for _, agent := range s.agents {
+		total += s.getActiveConnections(agent)
 	}
 	return total
 }
 
-// HandleListClients returns a list of connected clients
-func (s *Server) HandleListClients(w http.ResponseWriter, r *http.Request) {
+// HandleListClients returns a list of connected agents
+func (s *Server) HandleListAgents(w http.ResponseWriter, r *http.Request) {
 	s.mutex.RLock()
-	clientList := make([]map[string]interface{}, 0, len(s.clients))
-	for _, client := range s.clients {
-		activeConnections := s.getActiveConnections(client)
-		clientList = append(clientList, map[string]interface{}{
-			"id":                 client.ID,
-			"connected":          client.Connected,
-			"last_seen":          client.LastSeen,
-			"requests":           client.Requests,
-			"bytes_in":           client.BytesIn,
-			"bytes_out":          client.BytesOut,
-			"active":             client.isActive,
+	agentList := make([]map[string]interface{}, 0, len(s.agents))
+	for _, agent := range s.agents {
+		activeConnections := s.getActiveConnections(agent)
+		agentList = append(agentList, map[string]interface{}{
+			"id":                 agent.ID,
+			"connected":          agent.Connected,
+			"last_seen":          agent.LastSeen,
+			"requests":           agent.Requests,
+			"bytes_in":           agent.BytesIn,
+			"bytes_out":          agent.BytesOut,
+			"active":             agent.isActive,
 			"active_connections": activeConnections,
-			"subdomain":          client.ID + "." + s.config.Domain, // Add subdomain info
+			"subdomain":          agent.ID + "." + s.config.Domain, // Add subdomain info
 		})
 	}
 	totalConnections := s.getTotalActiveConnections()
@@ -534,8 +748,8 @@ func (s *Server) HandleListClients(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"clients":           clientList,
-		"count":             len(clientList),
+		"agents":            agentList,
+		"count":             len(agentList),
 		"total_connections": totalConnections,
 	})
 }
@@ -543,27 +757,27 @@ func (s *Server) HandleListClients(w http.ResponseWriter, r *http.Request) {
 // HandleStatus returns the server status page
 func (s *Server) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	s.mutex.RLock()
-	clientCount := len(s.clients)
+	agentCount := len(s.agents)
 	activeClients := 0
 	totalConnections := s.getTotalActiveConnections()
 
-	// Count active clients
-	for _, client := range s.clients {
-		if client.isActive {
+	// Count active agents
+	for _, agent := range s.agents {
+		if agent.isActive {
 			activeClients++
 		}
 	}
 
-	// Get detailed client info for the table
-	clientDetails := make([]map[string]interface{}, 0, len(s.clients))
-	for _, client := range s.clients {
-		activeConnections := s.getActiveConnections(client)
-		clientDetails = append(clientDetails, map[string]interface{}{
-			"id":                 client.ID,
-			"active":             client.isActive,
-			"connected":          client.Connected.Format("15:04:05"),
+	// Get detailed agent info for the table
+	agentDetails := make([]map[string]interface{}, 0, len(s.agents))
+	for _, agent := range s.agents {
+		activeConnections := s.getActiveConnections(agent)
+		agentDetails = append(agentDetails, map[string]interface{}{
+			"id":                 agent.ID,
+			"active":             agent.isActive,
+			"connected":          agent.Connected.Format("15:04:05"),
 			"active_connections": activeConnections,
-			"subdomain":          client.ID + "." + s.config.Domain,
+			"subdomain":          agent.ID + "." + s.config.Domain,
 		})
 	}
 	s.mutex.RUnlock()
@@ -585,13 +799,13 @@ func (s *Server) HandleStatus(w http.ResponseWriter, r *http.Request) {
         .stat-number { font-size: 2em; font-weight: bold; color: #007bff; }
         .stat-label { color: #6c757d; font-size: 0.9em; }
         .subdomain { background: #e3f2fd; padding: 10px; border-radius: 5px; margin: 10px 0; }
-        .client-table { width: 100%%; border-collapse: collapse; margin: 20px 0; }
-        .client-table th, .client-table td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
-        .client-table th { background-color: #f8f9fa; font-weight: bold; }
+        .agent-table { width: 100%%; border-collapse: collapse; margin: 20px 0; }
+        .agent-table th, .agent-table td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        .agent-table th { background-color: #f8f9fa; font-weight: bold; }
         .status-active { color: #28a745; font-weight: bold; }
         .status-inactive { color: #dc3545; font-weight: bold; }
         .connections-badge { background: #007bff; color: white; padding: 4px 8px; border-radius: 12px; font-size: 0.8em; }
-        .client { margin: 10px 0; padding: 15px; background: #f8f9fa; border-radius: 5px; border-left: 4px solid #007bff; }
+        .agent { margin: 10px 0; padding: 15px; background: #f8f9fa; border-radius: 5px; border-left: 4px solid #007bff; }
     </style>
     <script>
         function refreshPage() {
@@ -606,7 +820,7 @@ func (s *Server) HandleStatus(w http.ResponseWriter, r *http.Request) {
         <h1>🔌 TCP Tunnel Server</h1>
         <div class="status">
             <h2>Status: <span class="connected">Running</span> <small>(Auto-refresh: 5s)</small></h2>
-            <p><a href="/clients">View Clients (JSON)</a></p>
+            <p><a href="/agents">View Clients (JSON)</a></p>
         </div>
         
         <div class="stats">
@@ -633,7 +847,7 @@ func (s *Server) HandleStatus(w http.ResponseWriter, r *http.Request) {
         </div>
         
         <h3>📊 Connected Clients:</h3>
-        <table class="client-table">
+        <table class="agent-table">
             <thead>
                 <tr>
                     <th>Client ID</th>
@@ -643,20 +857,20 @@ func (s *Server) HandleStatus(w http.ResponseWriter, r *http.Request) {
                     <th>Subdomain</th>
                 </tr>
             </thead>
-            <tbody>`, clientCount, activeClients, totalConnections, s.config.TCPPort, s.config.Port)
+            <tbody>`, agentCount, activeClients, totalConnections, s.config.TCPPort, s.config.Port)
 
-	// Add client rows
-	for _, client := range clientDetails {
+	// Add agent rows
+	for _, agent := range agentDetails {
 		statusClass := "status-inactive"
 		statusText := "Inactive"
-		if client["active"].(bool) {
+		if agent["active"].(bool) {
 			statusClass = "status-active"
 			statusText = "Active"
 		}
 
 		connectionsText := ""
-		if client["active_connections"].(int) > 0 {
-			connectionsText = fmt.Sprintf(`<span class="connections-badge">%d</span>`, client["active_connections"].(int))
+		if agent["active_connections"].(int) > 0 {
+			connectionsText = fmt.Sprintf(`<span class="connections-badge">%d</span>`, agent["active_connections"].(int))
 		} else {
 			connectionsText = "0"
 		}
@@ -669,12 +883,12 @@ func (s *Server) HandleStatus(w http.ResponseWriter, r *http.Request) {
                     <td>%s</td>
                     <td><code>%s</code></td>
                 </tr>`,
-			client["id"].(string),
+			agent["id"].(string),
 			statusClass,
 			statusText,
-			client["connected"].(string),
+			agent["connected"].(string),
 			connectionsText,
-			client["subdomain"].(string))
+			agent["subdomain"].(string))
 	}
 
 	html += `
@@ -684,16 +898,16 @@ func (s *Server) HandleStatus(w http.ResponseWriter, r *http.Request) {
         <h3>🌐 Subdomain Routing:</h3>
         <div class="subdomain">
             <strong>How to use:</strong><br>
-            &bull; <code>client1.` + s.config.Domain + `</code> &rarr; Routes to client1<br>
-            &bull; <code>client2.` + s.config.Domain + `</code> &rarr; Routes to client2<br>
+            &bull; <code>agent1.` + s.config.Domain + `</code> &rarr; Routes to agent1<br>
+            &bull; <code>agent2.` + s.config.Domain + `</code> &rarr; Routes to agent2<br>
             &bull; <code>` + s.config.Domain + `</code> &rarr; Shows this status page
         </div>
         
         <h3>💡 Example Usage:</h3>
-        <div class="client">
-            <strong>SSH to client1:</strong> <code>ssh -p ` + s.config.TCPPort + ` client1.` + s.config.Domain + `</code><br>
-            <strong>HTTP to client2:</strong> <code>curl http://client2.` + s.config.Domain + `:` + s.config.Port + `/api</code><br>
-            <strong>Multiple curls:</strong> <code>for i in {1..100}; do curl http://client1.` + s.config.Domain + `:` + s.config.Port + `/ & done</code>
+        <div class="agent">
+            <strong>SSH to agent1:</strong> <code>ssh -p ` + s.config.TCPPort + ` agent1.` + s.config.Domain + `</code><br>
+            <strong>HTTP to agent2:</strong> <code>curl http://agent2.` + s.config.Domain + `:` + s.config.Port + `/api</code><br>
+            <strong>Multiple curls:</strong> <code>for i in {1..100}; do curl http://agent1.` + s.config.Domain + `:` + s.config.Port + `/ & done</code>
         </div>
     </div>
 </body>
@@ -703,5 +917,518 @@ func (s *Server) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	_, err := w.Write([]byte(html))
 	if err != nil {
 		return
+	}
+}
+
+// extractSubdomain returns the label before the first dot
+func extractSubdomain(host string) string {
+	if idx := strings.IndexByte(host, '.'); idx > 0 {
+		return host[:idx]
+	}
+	return host
+}
+
+// tryExtractHTTPHost tries to extract Host header from an HTTP request
+func tryExtractHTTPHost(initial []byte) (string, bool) {
+	data := string(initial)
+	if !strings.Contains(data, "HTTP/") {
+		return "", false
+	}
+	lower := strings.ToLower(data)
+	pos := strings.Index(lower, "\nhost:")
+	if pos == -1 {
+		if strings.HasPrefix(lower, "host:") {
+			pos = 0
+		} else {
+			return "", false
+		}
+	}
+	line := data[pos:]
+	if len(line) > 0 && line[0] == '\n' {
+		line = line[1:]
+	}
+	if nl := strings.IndexByte(line, '\n'); nl != -1 {
+		line = line[:nl]
+	}
+	parts := strings.SplitN(line, ":", 2)
+	if len(parts) < 2 {
+		return "", false
+	}
+	hostPort := strings.TrimSpace(parts[1])
+	if sp := strings.IndexByte(hostPort, ' '); sp != -1 {
+		hostPort = hostPort[:sp]
+	}
+	if colon := strings.IndexByte(hostPort, ':'); colon != -1 {
+		hostPort = hostPort[:colon]
+	}
+	if hostPort == "" {
+		return "", false
+	}
+	return hostPort, true
+}
+
+// tryExtractTLSSNI parses a TLS ClientHello to extract SNI without consuming beyond provided bytes
+func tryExtractTLSSNI(b []byte) (string, bool) {
+	if len(b) < 5 {
+		return "", false
+	}
+	// TLS record header
+	if b[0] != 0x16 { // Handshake
+		return "", false
+	}
+	// version b[1:3], length b[3:5]
+	recLen := int(b[3])<<8 | int(b[4])
+	if 5+recLen > len(b) {
+		// allow partial
+		recLen = len(b) - 5
+	}
+	p := 5
+	if p+4 > 5+recLen {
+		return "", false
+	}
+	// Handshake: type, len(3)
+	if b[p] != 0x01 { // ClientHello
+		return "", false
+	}
+	hLen := int(b[p+1])<<16 | int(b[p+2])<<8 | int(b[p+3])
+	p += 4
+	end := p + hLen
+	if end > len(b) {
+		end = len(b)
+	}
+	// agent_version(2) + random(32)
+	p += 2 + 32
+	if p >= end || p+1 > end {
+		return "", false
+	}
+	// session id
+	sidLen := int(b[p])
+	p += 1 + sidLen
+	if p+2 > end {
+		return "", false
+	}
+	// cipher suites
+	csLen := int(b[p])<<8 | int(b[p+1])
+	p += 2 + csLen
+	if p >= end || p+1 > end {
+		return "", false
+	}
+	// compression methods
+	cmLen := int(b[p])
+	p += 1 + cmLen
+	if p+2 > end {
+		return "", false
+	}
+	// extensions
+	extLen := int(b[p])<<8 | int(b[p+1])
+	p += 2
+	extEnd := p + extLen
+	if extEnd > end {
+		extEnd = end
+	}
+	for p+4 <= extEnd {
+		extType := int(b[p])<<8 | int(b[p+1])
+		extL := int(b[p+2])<<8 | int(b[p+3])
+		p += 4
+		if p+extL > extEnd {
+			break
+		}
+		if extType == 0x0000 { // server_name
+			q := p
+			if q+2 > p+extL {
+				break
+			}
+			listLen := int(b[q])<<8 | int(b[q+1])
+			q += 2
+			listEnd := q + listLen
+			if listEnd > p+extL {
+				listEnd = p + extL
+			}
+			for q+3 <= listEnd {
+				nType := b[q]
+				nLen := int(b[q+1])<<8 | int(b[q+2])
+				q += 3
+				if nType != 0x00 {
+					break
+				}
+				if q+nLen > listEnd {
+					break
+				}
+				host := string(b[q : q+nLen])
+				return host, true
+			}
+		}
+		p += extL
+	}
+	return "", false
+}
+
+// selectClientForInitialData chooses a agent based on the initial bytes (HTTP Host or TLS SNI). If none found and exactly 1 agent exists, returns it; otherwise nil.
+func (s *Server) selectAgentForInitialData(initial []byte) *Agent {
+	nameAttempted := false
+	// Try HTTP Host
+	if host, ok := tryExtractHTTPHost(initial); ok {
+		nameAttempted = true
+		sub := extractSubdomain(host)
+		log.Printf("🔍 Extracted host: %s, subdomain: %s", host, sub)
+		s.mutex.RLock()
+		c := s.agents[sub]
+		log.Printf("🔍 Available agents: %v", func() []string {
+			var keys []string
+			for k := range s.agents {
+				keys = append(keys, k)
+			}
+			return keys
+		}())
+		s.mutex.RUnlock()
+		if c != nil {
+			log.Printf("✅ Found agent: %s", c.ID)
+			return c
+		}
+		log.Printf("❌ No agent found for subdomain: %s", sub)
+	}
+	// Try TLS SNI
+	if host, ok := tryExtractTLSSNI(initial); ok {
+		nameAttempted = true
+		sub := extractSubdomain(host)
+		s.mutex.RLock()
+		c := s.agents[sub]
+		s.mutex.RUnlock()
+		if c != nil {
+			return c
+		}
+	}
+	// If a name was presented but didn't match, do not fallback
+	if nameAttempted {
+		log.Printf("❌ Name was attempted but no agent found, not falling back")
+		return nil
+	}
+	// Fallback only if a single agent exists and no name was presented
+	s.mutex.RLock()
+	log.Printf("🔍 No name attempted, checking fallback. Found %d agents", len(s.agents))
+	if len(s.agents) == 1 {
+		for _, c := range s.agents {
+			log.Printf("✅ Using single available agent as fallback: %s", c.ID)
+			s.mutex.RUnlock()
+			return c
+		}
+	}
+	s.mutex.RUnlock()
+	log.Printf("❌ No suitable agent found for fallback")
+	return nil
+}
+
+// handleMultiplexedTunnel handles THE ONLY multiplexed stream for the agent
+func (s *Server) handleMultiplexedTunnel(w http.ResponseWriter, r *http.Request, agentID string) {
+	ultraPersistent := r.Header.Get("X-Ultra-Persistent")
+	log.Printf("🔗 Starting THE ONLY ultra-persistent multiplexed tunnel for agent %s (ultra-persistent: %s)", agentID, ultraPersistent)
+
+	// Set headers for streaming
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+
+	// Flush headers immediately
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+
+	// Create multiplexed connection manager
+	muxManager := &MultiplexedManager{
+		agentID:     agentID,
+		toAgent:     w,
+		fromAgent:   r.Body,
+		connections: make(map[uint32]*ServerTCPConnection),
+		mutex:       sync.RWMutex{},
+		nextConnID:  1,
+		done:        make(chan struct{}),
+		writeQueue:  make(chan []byte, 1000), // Buffered for high concurrency
+	}
+
+	// Register this agent as using multiplexed mode
+	s.mutex.Lock()
+	agent, ok := s.agents[agentID]
+	if !ok {
+		agent = &Agent{
+			ID:                 agentID,
+			Connected:          time.Now(),
+			LastSeen:           time.Now(),
+			isActive:           true,
+			userConnections:    make(map[string]chan []byte),
+			h2Streams:          make(chan *H2Stream, 32),
+			done:               make(chan bool),
+			multiplexedManager: muxManager,
+		}
+		s.agents[agentID] = agent
+	} else {
+		agent.isActive = true
+		agent.LastSeen = time.Now()
+		agent.multiplexedManager = muxManager
+	}
+	s.mutex.Unlock()
+
+	var wg sync.WaitGroup
+
+	// Start frame handler for incoming data from agent
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.handleIncomingMuxFrames(muxManager)
+	}()
+
+	// Start non-blocking write worker
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.handleWriteQueue(muxManager)
+	}()
+
+	// Start TCP listener redirect - route new connections to multiplexed tunnel
+	log.Printf("✅ Multiplexed tunnel ready for agent %s", agentID)
+
+	// Wait for context cancellation or connection close
+	<-r.Context().Done()
+	close(muxManager.done)
+	close(muxManager.writeQueue) // Close write queue to stop worker
+	wg.Wait()
+
+	// CRITICAL: Clean up all TCP connections and manager when stream closes
+	// First, close all TCP connections WITHOUT holding server mutex to avoid deadlock
+	log.Printf("🧹 Cleaning up multiplexed manager for agent %s", agentID)
+	muxManager.mutex.Lock()
+	connectionsToClose := make([]*ServerTCPConnection, 0, len(muxManager.connections))
+	for connID, tcpConn := range muxManager.connections {
+		log.Printf("🔌 Closing TCP connection %d for agent %s", connID, agentID)
+		connectionsToClose = append(connectionsToClose, tcpConn)
+	}
+	// Clear connections map
+	muxManager.connections = make(map[uint32]*ServerTCPConnection)
+	muxManager.mutex.Unlock()
+
+	// Close connections outside of any lock
+	for _, tcpConn := range connectionsToClose {
+		if tcpConn.UserConn != nil {
+			tcpConn.UserConn.Close()
+		}
+		close(tcpConn.done)
+	}
+
+	// Now safely update agent
+	s.mutex.Lock()
+	if agent, ok := s.agents[agentID]; ok {
+		if agent.multiplexedManager == muxManager {
+			agent.multiplexedManager = nil
+		}
+	}
+	s.mutex.Unlock()
+
+	log.Printf("🔌 Multiplexed tunnel closed for agent %s", agentID)
+}
+
+// handleWriteQueue processes writes to agent in background to avoid blocking
+func (s *Server) handleWriteQueue(mux *MultiplexedManager) {
+	log.Printf("🚀 Starting non-blocking write queue for agent %s", mux.agentID)
+
+	for {
+		select {
+		case <-mux.done:
+			log.Printf("💀 Write queue stopping for agent %s", mux.agentID)
+			return
+		case frame := <-mux.writeQueue:
+			// Write frame with timeout
+			done := make(chan error, 1)
+			go func() {
+				_, err := mux.toAgent.Write(frame)
+				done <- err
+			}()
+
+			select {
+			case err := <-done:
+				if err != nil {
+					log.Printf("⚠️ Write queue error for agent %s: %v", mux.agentID, err)
+					// Continue processing other frames
+				} else {
+					// Flush immediately after successful write
+					if flusher, ok := mux.toAgent.(http.Flusher); ok {
+						flusher.Flush()
+					}
+				}
+			case <-time.After(1 * time.Second):
+				log.Printf("⚠️ Write queue timeout for agent %s", mux.agentID)
+				// Continue processing other frames
+			case <-mux.done:
+				return
+			}
+		}
+	}
+}
+
+// Structures moved to types.go to avoid duplication
+
+// handleIncomingMuxFrames processes frames from agent and routes to TCP connections
+func (s *Server) handleIncomingMuxFrames(mux *MultiplexedManager) {
+	for {
+		select {
+		case <-mux.done:
+			return
+		default:
+			// Read frame header (8 bytes: 4 bytes conn_id + 4 bytes length)
+			header := make([]byte, 8)
+			if _, err := io.ReadFull(mux.fromAgent, header); err != nil {
+				if err != io.EOF {
+					log.Printf("⚠️ Error reading mux frame header: %v", err)
+				}
+				return
+			}
+
+			connID := uint32(header[0])<<24 | uint32(header[1])<<16 | uint32(header[2])<<8 | uint32(header[3])
+			length := uint32(header[4])<<24 | uint32(header[5])<<16 | uint32(header[6])<<8 | uint32(header[7])
+
+			if length == 0 {
+				if connID == 0 {
+					// Heartbeat frame - just log and ignore
+					log.Printf("🫀 Received heartbeat from agent %s - stream is alive", mux.agentID)
+					continue
+				} else {
+					// Control frame (connection close)
+					s.closeMuxConnection(mux, connID)
+					continue
+				}
+			}
+
+			if length > 64*1024 {
+				log.Printf("⚠️ Mux frame too large: %d bytes", length)
+				return
+			}
+
+			// Read frame data
+			data := make([]byte, length)
+			if _, err := io.ReadFull(mux.fromAgent, data); err != nil {
+				log.Printf("⚠️ Error reading mux frame data: %v", err)
+				return
+			}
+
+			// Route to existing connection
+			s.routeToUserConnection(mux, connID, data)
+		}
+	}
+}
+
+// routeToUserConnection sends data to specific user TCP connection
+func (s *Server) routeToUserConnection(mux *MultiplexedManager, connID uint32, data []byte) {
+	mux.mutex.RLock()
+	serverConn, exists := mux.connections[connID]
+	mux.mutex.RUnlock()
+
+	if !exists {
+		log.Printf("⚠️ Mux connection %d not found", connID)
+		return
+	}
+
+	// Write data to user connection
+	if _, err := serverConn.UserConn.Write(data); err != nil {
+		log.Printf("⚠️ Error writing to user conn %d: %v", connID, err)
+		s.closeMuxConnection(mux, connID)
+	}
+}
+
+// closeMuxConnection closes a multiplexed TCP connection
+func (s *Server) closeMuxConnection(mux *MultiplexedManager, connID uint32) {
+	mux.mutex.Lock()
+	serverConn, exists := mux.connections[connID]
+	if exists {
+		delete(mux.connections, connID)
+	}
+	mux.mutex.Unlock()
+
+	if exists {
+		close(serverConn.done)
+		serverConn.UserConn.Close()
+		log.Printf("🔌 Mux connection %d closed", connID)
+	}
+}
+
+// createMuxConnection creates a new multiplexed connection for user traffic
+func (s *Server) createMuxConnection(mux *MultiplexedManager, userConn net.Conn) uint32 {
+	// Use atomic operation for connection ID to avoid contention
+	connID := atomic.AddUint32(&mux.nextConnID, 1)
+
+	serverConn := &ServerTCPConnection{
+		ID:       connID,
+		UserConn: userConn,
+		toAgent:  make(chan []byte, 100),
+		done:     make(chan struct{}),
+	}
+
+	// Minimize lock time - only for map write
+	mux.mutex.Lock()
+	mux.connections[connID] = serverConn
+	mux.mutex.Unlock()
+
+	log.Printf("🔗 Created mux connection %d for user %s", connID, userConn.RemoteAddr())
+
+	// Start goroutine to read from user and send to agent
+	go s.readFromUserToAgent(mux, serverConn)
+
+	return connID
+}
+
+// readFromUserToAgent reads data from user connection and sends as frames to agent
+func (s *Server) readFromUserToAgent(mux *MultiplexedManager, serverConn *ServerTCPConnection) {
+	defer s.closeMuxConnection(mux, serverConn.ID)
+
+	buffer := make([]byte, 32*1024)
+	for {
+		select {
+		case <-serverConn.done:
+			return
+		case <-mux.done:
+			return
+		default:
+			serverConn.UserConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			n, err := serverConn.UserConn.Read(buffer)
+			if n > 0 {
+				// Send frame to agent: [conn_id(4)] + [length(4)] + [data]
+				frame := make([]byte, 8+n)
+
+				// Write connection ID (big-endian)
+				frame[0] = byte(serverConn.ID >> 24)
+				frame[1] = byte(serverConn.ID >> 16)
+				frame[2] = byte(serverConn.ID >> 8)
+				frame[3] = byte(serverConn.ID)
+
+				// Write data length (big-endian)
+				dataLen := uint32(n)
+				frame[4] = byte(dataLen >> 24)
+				frame[5] = byte(dataLen >> 16)
+				frame[6] = byte(dataLen >> 8)
+				frame[7] = byte(dataLen)
+
+				// Copy data
+				copy(frame[8:], buffer[:n])
+
+				// Send frame to agent via non-blocking queue
+				select {
+				case mux.writeQueue <- frame:
+					// Frame queued successfully
+				case <-time.After(50 * time.Millisecond):
+					log.Printf("⚠️ Write queue full for conn %d", serverConn.ID)
+					return
+				case <-mux.done:
+					return
+				case <-serverConn.done:
+					return
+				}
+			}
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				if err != io.EOF {
+					log.Printf("⚠️ Error reading from user conn %d: %v", serverConn.ID, err)
+				}
+				return
+			}
+		}
 	}
 }

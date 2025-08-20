@@ -2,4 +2,6 @@ module server
 
 go 1.24
 
-require github.com/gorilla/websocket v1.5.0
+require golang.org/x/net v0.43.0
+
+require golang.org/x/text v0.28.0 // indirect
