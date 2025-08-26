@@ -37,9 +37,13 @@ func main() {
 
 	// Start TCP user listener (accepts user connections) and HTTP/2 mTLS server (accepts agent streams)
 	go server.StartTCPTunnelServer()
+	// Start H2 TLS server (non-blocking). If misconfigured, it will log and return.
+	go server.StartH2TLSServer()
 
-	// Start H2 TLS server (blocking)
-	server.StartH2TLSServer()
+	// Start admin HTTP server (blocking)
+	if err := http.ListenAndServe(":"+config.Port, nil); err != nil {
+		log.Printf("❌ HTTP server failed: %v", err)
+	}
 }
 
 func getEnv(key, defaultValue string) string {
