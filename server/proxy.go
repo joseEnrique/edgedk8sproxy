@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -296,8 +298,9 @@ func (s *Server) forwardUserToMuxAgent(userConn net.Conn, agent *Agent, initialD
 
 	// Send initial data as first frame if any
 	if len(initialData) > 0 {
+		payload := compressData(initialData)
 		// Send frame to agent: [conn_id(4)] + [length(4)] + [data]
-		frame := make([]byte, 8+len(initialData))
+		frame := make([]byte, 8+len(payload))
 
 		// Write connection ID (big-endian)
 		frame[0] = byte(connID >> 24)
@@ -306,14 +309,14 @@ func (s *Server) forwardUserToMuxAgent(userConn net.Conn, agent *Agent, initialD
 		frame[3] = byte(connID)
 
 		// Write data length (big-endian)
-		dataLen := uint32(len(initialData))
+		dataLen := uint32(len(payload))
 		frame[4] = byte(dataLen >> 24)
 		frame[5] = byte(dataLen >> 16)
 		frame[6] = byte(dataLen >> 8)
 		frame[7] = byte(dataLen)
 
 		// Copy data
-		copy(frame[8:], initialData)
+		copy(frame[8:], payload)
 
 		// Send frame to agent via non-blocking queue
 		select {
@@ -1325,8 +1328,9 @@ func (s *Server) routeToUserConnection(mux *MultiplexedManager, connID uint32, d
 		return
 	}
 
-	// Write data to user connection
-	if _, err := serverConn.UserConn.Write(data); err != nil {
+	// Decompress and write data to user connection
+	plain := decompressData(data)
+	if _, err := serverConn.UserConn.Write(plain); err != nil {
 		log.Printf("⚠️ Error writing to user conn %d: %v", connID, err)
 		s.closeMuxConnection(mux, connID)
 	}
@@ -1377,7 +1381,7 @@ func (s *Server) createMuxConnection(mux *MultiplexedManager, userConn net.Conn)
 func (s *Server) readFromUserToAgent(mux *MultiplexedManager, serverConn *ServerTCPConnection) {
 	defer s.closeMuxConnection(mux, serverConn.ID)
 
-	buffer := make([]byte, 32*1024)
+	buffer := make([]byte, 64*1024)
 	for {
 		select {
 		case <-serverConn.done:
@@ -1385,11 +1389,12 @@ func (s *Server) readFromUserToAgent(mux *MultiplexedManager, serverConn *Server
 		case <-mux.done:
 			return
 		default:
-			serverConn.UserConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			serverConn.UserConn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
 			n, err := serverConn.UserConn.Read(buffer)
 			if n > 0 {
-				// Send frame to agent: [conn_id(4)] + [length(4)] + [data]
-				frame := make([]byte, 8+n)
+				// Compress and send frame to agent: [conn_id(4)] + [length(4)] + [data]
+				payload := compressData(buffer[:n])
+				frame := make([]byte, 8+len(payload))
 
 				// Write connection ID (big-endian)
 				frame[0] = byte(serverConn.ID >> 24)
@@ -1398,14 +1403,14 @@ func (s *Server) readFromUserToAgent(mux *MultiplexedManager, serverConn *Server
 				frame[3] = byte(serverConn.ID)
 
 				// Write data length (big-endian)
-				dataLen := uint32(n)
+				dataLen := uint32(len(payload))
 				frame[4] = byte(dataLen >> 24)
 				frame[5] = byte(dataLen >> 16)
 				frame[6] = byte(dataLen >> 8)
 				frame[7] = byte(dataLen)
 
 				// Copy data
-				copy(frame[8:], buffer[:n])
+				copy(frame[8:], payload)
 
 				// Send frame to agent via non-blocking queue
 				select {
@@ -1431,4 +1436,34 @@ func (s *Server) readFromUserToAgent(mux *MultiplexedManager, serverConn *Server
 			}
 		}
 	}
+}
+
+// compressData gzips the given data unconditionally and prefixes with 'G”Z'
+func compressData(data []byte) []byte {
+	var buf bytes.Buffer
+	zw, _ := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	_, _ = zw.Write(data)
+	_ = zw.Close()
+	comp := buf.Bytes()
+	out := make([]byte, 0, len(comp)+2)
+	out = append(out, 'G', 'Z')
+	out = append(out, comp...)
+	return out
+}
+
+// decompressData gunzips data if prefixed with 'G”Z', otherwise returns as-is
+func decompressData(data []byte) []byte {
+	if len(data) >= 2 && data[0] == 'G' && data[1] == 'Z' {
+		r, err := gzip.NewReader(bytes.NewReader(data[2:]))
+		if err != nil {
+			return data
+		}
+		defer r.Close()
+		plain, err := io.ReadAll(r)
+		if err != nil {
+			return data
+		}
+		return plain
+	}
+	return data
 }

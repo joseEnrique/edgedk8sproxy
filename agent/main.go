@@ -8,9 +8,10 @@ import (
 
 func main() {
 	config := &Config{
-		ServerHost: getEnv("SERVER_HOST", "51.44.245.239"),
-		H2Port:     getEnv("H2_PORT", "8443"),
-		AgentID:    getEnv("AGENT_ID", "agent1"),
+		ServerHost: getEnv("SERVER_HOST", "localhost"),
+		//ServerHost: getEnv("SERVER_HOST", "51.44.245.239"),
+		H2Port:  getEnv("H2_PORT", "8443"),
+		AgentID: getEnv("AGENT_ID", "agent1"),
 
 		// Single forwarding target - all TCP traffic goes here
 		ForwardHost: getEnv("FORWARD_HOST", "192.168.1.2"),

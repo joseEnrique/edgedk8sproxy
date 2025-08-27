@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -485,8 +487,10 @@ func (a *Agent) handleIncomingFrames(reader io.Reader, connManager *AgentConnect
 				// This shouldn't happen in this direction (server sends to existing connections)
 				log.Printf("⚠️ Received frame with connID 0 from server")
 			} else {
+				// Always decompress incoming data
+				plain := decompressData(data[:length])
 				// Route to existing connection, or create new one if needed
-				a.routeToConnection(connManager, connID, data)
+				a.routeToConnection(connManager, connID, plain)
 			}
 		}
 	}
@@ -494,7 +498,7 @@ func (a *Agent) handleIncomingFrames(reader io.Reader, connManager *AgentConnect
 
 // handleOutgoingFrames sends data from TCP connections as frames to server
 func (a *Agent) handleOutgoingFrames(writer io.Writer, connManager *AgentConnectionManager, done <-chan struct{}, connectionLost chan<- error) {
-	ticker := time.NewTicker(50 * time.Millisecond) // Reduced frequency from 10ms to 50ms
+	ticker := time.NewTicker(1 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -519,8 +523,10 @@ func (a *Agent) handleOutgoingFrames(writer io.Writer, connManager *AgentConnect
 			for _, tcpConn := range connections {
 				select {
 				case data := <-tcpConn.fromTarget:
+					// Always compress outgoing data
+					payload := compressData(data)
 					// Use buffer pool for frame creation
-					frameSize := 8 + len(data)
+					frameSize := 8 + len(payload)
 					frame := getBuffer(frameSize)
 
 					// Write connection ID (big-endian)
@@ -530,14 +536,14 @@ func (a *Agent) handleOutgoingFrames(writer io.Writer, connManager *AgentConnect
 					frame[3] = byte(tcpConn.ID)
 
 					// Write data length (big-endian)
-					dataLen := uint32(len(data))
+					dataLen := uint32(len(payload))
 					frame[4] = byte(dataLen >> 24)
 					frame[5] = byte(dataLen >> 16)
 					frame[6] = byte(dataLen >> 8)
 					frame[7] = byte(dataLen)
 
 					// Copy data
-					copy(frame[8:], data)
+					copy(frame[8:], payload)
 
 					// Send frame to server
 					if _, err := writer.Write(frame[:frameSize]); err != nil {
@@ -638,13 +644,13 @@ func (a *Agent) closeConnection(connManager *AgentConnectionManager, connID uint
 
 // readFromTarget reads data from target and queues for server
 func (a *Agent) readFromTarget(tcpConn *AgentTCPConnection) {
-	buffer := make([]byte, 32*1024)
+	buffer := make([]byte, 64*1024)
 	for {
 		select {
 		case <-tcpConn.done:
 			return
 		default:
-			tcpConn.Conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			tcpConn.Conn.SetReadDeadline(time.Now().Add(5 * time.Millisecond))
 			n, err := tcpConn.Conn.Read(buffer)
 			if n > 0 {
 				data := make([]byte, n)
@@ -982,4 +988,33 @@ func isConnectionClosed(err error) bool {
 // Stop stops the agent
 func (a *Agent) Stop() {
 	close(a.done)
+}
+
+// Helpers for mandatory compression in tunnel frames
+func compressData(data []byte) []byte {
+	var buf bytes.Buffer
+	zw, _ := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	_, _ = zw.Write(data)
+	_ = zw.Close()
+	comp := buf.Bytes()
+	out := make([]byte, 0, len(comp)+2)
+	out = append(out, 'G', 'Z')
+	out = append(out, comp...)
+	return out
+}
+
+func decompressData(data []byte) []byte {
+	if len(data) >= 2 && data[0] == 'G' && data[1] == 'Z' {
+		r, err := gzip.NewReader(bytes.NewReader(data[2:]))
+		if err != nil {
+			return data
+		}
+		defer r.Close()
+		plain, err := io.ReadAll(r)
+		if err != nil {
+			return data
+		}
+		return plain
+	}
+	return data
 }
