@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 )
 
 func main() {
@@ -18,6 +19,12 @@ func main() {
 		TLSCertFile: getEnv("TLS_CERT_FILE", ""),
 		TLSKeyFile:  getEnv("TLS_KEY_FILE", ""),
 		TLSClientCA: getEnv("TLS_CLIENT_CA_FILE", ""),
+	}
+
+	// DOMAIN_MAP syntax: "quique.es=agent1,foo.bar=agent2"; matches any subdomain suffix
+	if dm := getEnv("DOMAIN_MAP", ""); dm != "" {
+		config.DomainMap = parseDomainMap(dm)
+		log.Printf("🔧 Domain map loaded: %v", config.DomainMap)
 	}
 
 	// Create server
@@ -60,4 +67,26 @@ func getEnvAsInt(key string, defaultValue int) int {
 		}
 	}
 	return defaultValue
+}
+
+// parseDomainMap parses comma-separated domain=agent pairs
+func parseDomainMap(s string) map[string]string {
+	m := make(map[string]string)
+	items := strings.Split(s, ",")
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		parts := strings.SplitN(item, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		domain := strings.ToLower(strings.TrimSpace(parts[0]))
+		agent := strings.TrimSpace(parts[1])
+		if domain != "" && agent != "" {
+			m[domain] = agent
+		}
+	}
+	return m
 }

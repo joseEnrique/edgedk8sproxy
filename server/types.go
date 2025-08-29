@@ -39,6 +39,7 @@ type Config struct {
 	TLSCertFile string
 	TLSKeyFile  string
 	TLSClientCA string
+	DomainMap   map[string]string
 }
 
 // UserSession represents a single user connection session multiplexed over the tunnel

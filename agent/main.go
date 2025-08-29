@@ -14,8 +14,8 @@ func main() {
 		AgentID: getEnv("AGENT_ID", "agent1"),
 
 		// Single forwarding target - all TCP traffic goes here
-		ForwardHost: getEnv("FORWARD_HOST", "192.168.1.2"),
-		ForwardPort: getEnvAsInt("FORWARD_PORT", 6443),
+		ForwardHost: getEnv("FORWARD_HOST", "localhost"),
+		ForwardPort: getEnvAsInt("FORWARD_PORT", 3000),
 
 		// H2 mTLS
 		TLSCertFile: getEnv("TLS_CERT_FILE", ""),

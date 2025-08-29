@@ -612,10 +612,24 @@ func (s *Server) tunnelReader(agent *Agent) {
 
 // HandleRoot handles the root endpoint and routes requests based on subdomain
 func (s *Server) HandleRoot(w http.ResponseWriter, r *http.Request) {
-	// Extract subdomain from host
+	// Extract host
 	host := r.Host
-	subdomain := ""
+	// Try domain suffix mapping first (matches any subdomain)
+	if s.config != nil && len(s.config.DomainMap) > 0 {
+		lower := strings.ToLower(host)
+		// strip port if present
+		if colon := strings.IndexByte(lower, ':'); colon != -1 {
+			lower = lower[:colon]
+		}
+		if mapped := s.lookupAgentByDomainSuffix(lower); mapped != nil {
+			log.Printf("🌐 Routing via domain map '%s' -> agent '%s'", host, mapped.ID)
+			s.forwardHTTPRequestToAgent(w, r, mapped)
+			return
+		}
+	}
 
+	// Fallback: subdomain-based routing
+	subdomain := ""
 	if idx := strings.Index(host, "."); idx > 0 {
 		subdomain = host[:idx]
 	}
@@ -1072,6 +1086,12 @@ func (s *Server) selectAgentForInitialData(initial []byte) *Agent {
 	// Try HTTP Host
 	if host, ok := tryExtractHTTPHost(initial); ok {
 		nameAttempted = true
+		// Domain map first
+		if s.config != nil && len(s.config.DomainMap) > 0 {
+			if mapped := s.lookupAgentByDomainSuffix(strings.ToLower(host)); mapped != nil {
+				return mapped
+			}
+		}
 		sub := extractSubdomain(host)
 		log.Printf("🔍 Extracted host: %s, subdomain: %s", host, sub)
 		s.mutex.RLock()
@@ -1093,6 +1113,12 @@ func (s *Server) selectAgentForInitialData(initial []byte) *Agent {
 	// Try TLS SNI
 	if host, ok := tryExtractTLSSNI(initial); ok {
 		nameAttempted = true
+		// Domain map first
+		if s.config != nil && len(s.config.DomainMap) > 0 {
+			if mapped := s.lookupAgentByDomainSuffix(strings.ToLower(host)); mapped != nil {
+				return mapped
+			}
+		}
 		sub := extractSubdomain(host)
 		s.mutex.RLock()
 		c := s.agents[sub]
@@ -1466,4 +1492,30 @@ func decompressData(data []byte) []byte {
 		return plain
 	}
 	return data
+}
+
+// lookupAgentByDomainSuffix finds agent by matching host against configured domain suffixes
+func (s *Server) lookupAgentByDomainSuffix(host string) *Agent {
+	if s.config == nil || len(s.config.DomainMap) == 0 {
+		return nil
+	}
+	// Match the longest suffix first
+	bestLen := -1
+	bestAgentID := ""
+	for suffix, agentID := range s.config.DomainMap {
+		if strings.HasSuffix(host, suffix) {
+			if len(suffix) > bestLen {
+				bestLen = len(suffix)
+				bestAgentID = agentID
+			}
+		}
+	}
+	if bestAgentID == "" {
+		return nil
+	}
+	// Resolve agent by ID
+	s.mutex.RLock()
+	a := s.agents[bestAgentID]
+	s.mutex.RUnlock()
+	return a
 }
