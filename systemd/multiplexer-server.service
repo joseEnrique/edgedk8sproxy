@@ -1,0 +1,24 @@
+[Unit]
+Description=Multiplexer Server (HTTP/2 Tunnel Server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Edit env file at /etc/multiplexer-server/server.env
+EnvironmentFile=/etc/multiplexer-server/server.env
+# Run as dedicated user (create before enabling)
+User=multiplexer-server
+Group=multiplexer-server
+ExecStart=/usr/local/bin/server
+Restart=always
+RestartSec=2
+# Hardening (adjust as needed)
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
