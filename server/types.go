@@ -25,8 +25,7 @@ type MultiplexedManager struct {
 	nextConnID  uint32
 	done        chan struct{}
 	// Non-blocking write system
-	writeQueue  chan []byte
-	writeWorker sync.Once
+	writeQueue chan []byte
 }
 
 // Config holds server configuration

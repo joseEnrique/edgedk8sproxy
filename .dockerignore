@@ -1,47 +1,34 @@
-# Git
+# VCS / OS
 .git
 .gitignore
-
-# Documentation
-README.md
-*.md
-
-# Build artifacts
-build/
-bin/
-*.exe
-*.dll
-*.so
-*.dylib
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
 .DS_Store
-Thumbs.db
 
-# Logs
+# Certificates and secrets (do not include in image)
+**/*.key
+**/*.pem
+**/*.crt
+**/*.cer
+**/*.p12
+**/*.pfx
+**/*.der
+**/*.csr
+certs/
+.env
+*.env
+*.env.*
+
+# Build artifacts / deps
+build/
+dist/
+node_modules/
+
+# Logs and misc
 *.log
+logs/
 
-# Test files
-*_test.go
-test/
+# Tests and diagrams (not needed in final images)
+diagrams/
+TESTING_*.md
 
-# Kubernetes manifests
-k8s/
-
-# Scripts
-scripts/
-*.sh
-
-# Docker
-Dockerfile*
-.dockerignore
-
-# Temporary files
-*.tmp
-*.temp 
+# Shell scripts (exclude from context)
+*.sh 
