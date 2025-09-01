@@ -30,3 +30,8 @@ func NewAgent(config *Config) *Agent {
 		done:   make(chan bool),
 	}
 }
+
+// Stop signals the agent to stop gracefully
+func (a *Agent) Stop() {
+	close(a.done)
+}

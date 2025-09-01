@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,48 @@ import (
 
 	"golang.org/x/net/http2"
 )
+
+var gzipWriterPool = sync.Pool{New: func() interface{} {
+	zw, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed)
+	return zw
+}}
+
+var bytesBufferPool = sync.Pool{New: func() interface{} { return new(bytes.Buffer) }}
+
+// Compression threshold (bytes). Payloads smaller than this won't be compressed.
+var compressThresholdServer = 32768
+
+// Adaptive batching thresholds for server write queue
+var serverBatchMaxBytes = 64 * 1024
+var serverBatchMaxFrames = 8
+var serverBatchMaxDelay = 1 * time.Millisecond
+
+func init() {
+	if v := os.Getenv("COMPRESS_THRESHOLD_SERVER"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			compressThresholdServer = n
+		}
+	} else if v := os.Getenv("COMPRESS_THRESHOLD"); v != "" { // fallback to common var
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			compressThresholdServer = n
+		}
+	}
+	if v := os.Getenv("SERVER_BATCH_MAX_BYTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			serverBatchMaxBytes = n
+		}
+	}
+	if v := os.Getenv("SERVER_BATCH_MAX_FRAMES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			serverBatchMaxFrames = n
+		}
+	}
+	if v := os.Getenv("SERVER_BATCH_MAX_DELAY_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			serverBatchMaxDelay = time.Duration(n) * time.Millisecond
+		}
+	}
+}
 
 // StartTCPTunnelServer starts the TCP tunnel server for client connections
 func (s *Server) StartTCPTunnelServer() {
@@ -1258,36 +1301,65 @@ func (s *Server) handleMultiplexedTunnel(w http.ResponseWriter, r *http.Request,
 func (s *Server) handleWriteQueue(mux *MultiplexedManager) {
 	log.Printf("🚀 Starting non-blocking write queue for agent %s", mux.agentID)
 
+	batch := bytesBufferPool.Get().(*bytes.Buffer)
+	batch.Reset()
+	defer bytesBufferPool.Put(batch)
+
+	framesInBatch := 0
+	bytesInBatch := 0
+	var flushTimer *time.Timer
+	var flushC <-chan time.Time
+
+	flush := func() {
+		if bytesInBatch == 0 {
+			return
+		}
+		if _, err := mux.toAgent.Write(batch.Bytes()); err != nil {
+			log.Printf("⚠️ Write queue error for agent %s: %v", mux.agentID, err)
+		}
+		if flusher, ok := mux.toAgent.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		batch.Reset()
+		framesInBatch = 0
+		bytesInBatch = 0
+		if flushTimer != nil {
+			if !flushTimer.Stop() {
+				select {
+				case <-flushTimer.C:
+				default:
+				}
+			}
+			flushC = nil
+		}
+	}
+
 	for {
 		select {
 		case <-mux.done:
+			flush()
 			log.Printf("💀 Write queue stopping for agent %s", mux.agentID)
 			return
-		case frame := <-mux.writeQueue:
-			// Write frame with timeout
-			done := make(chan error, 1)
-			go func() {
-				_, err := mux.toAgent.Write(frame)
-				done <- err
-			}()
-
-			select {
-			case err := <-done:
-				if err != nil {
-					log.Printf("⚠️ Write queue error for agent %s: %v", mux.agentID, err)
-					// Continue processing other frames
-				} else {
-					// Flush immediately after successful write
-					if flusher, ok := mux.toAgent.(http.Flusher); ok {
-						flusher.Flush()
-					}
-				}
-			case <-time.After(1 * time.Second):
-				log.Printf("⚠️ Write queue timeout for agent %s", mux.agentID)
-				// Continue processing other frames
-			case <-mux.done:
+		case frame, ok := <-mux.writeQueue:
+			if !ok {
+				flush()
 				return
 			}
+			batch.Grow(len(frame))
+			_, _ = batch.Write(frame)
+			framesInBatch++
+			bytesInBatch += len(frame)
+
+			if framesInBatch >= serverBatchMaxFrames || bytesInBatch >= serverBatchMaxBytes {
+				flush()
+				continue
+			}
+			if flushC == nil {
+				flushTimer = time.NewTimer(serverBatchMaxDelay)
+				flushC = flushTimer.C
+			}
+		case <-flushC:
+			flush()
 		}
 	}
 }
@@ -1325,8 +1397,8 @@ func (s *Server) handleIncomingMuxFrames(mux *MultiplexedManager) {
 				}
 			}
 
-			if length > 64*1024 {
-				log.Printf("⚠️ Mux frame too large: %d bytes", length)
+			if length > 256*1024 {
+				log.Printf("⚠️ Mux frame too large: %d bytes (limit 256KB)", length)
 				return
 			}
 
@@ -1464,16 +1536,28 @@ func (s *Server) readFromUserToAgent(mux *MultiplexedManager, serverConn *Server
 	}
 }
 
-// compressData gzips the given data unconditionally and prefixes with 'G”Z'
+// compressData gzips the given data (if above threshold) and prefixes with 'G','Z'
 func compressData(data []byte) []byte {
-	var buf bytes.Buffer
-	zw, _ := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	if len(data) < compressThresholdServer {
+		return data
+	}
+	buf := bytesBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	zw := gzipWriterPool.Get().(*gzip.Writer)
+	zw.Reset(buf)
 	_, _ = zw.Write(data)
 	_ = zw.Close()
 	comp := buf.Bytes()
 	out := make([]byte, 0, len(comp)+2)
 	out = append(out, 'G', 'Z')
 	out = append(out, comp...)
+	// Avoid retaining huge buffers in pool
+	if buf.Cap() <= 64*1024 {
+		buf.Reset()
+		bytesBufferPool.Put(buf)
+	}
+	zw.Reset(io.Discard)
+	gzipWriterPool.Put(zw)
 	return out
 }
 

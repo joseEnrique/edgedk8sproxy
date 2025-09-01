@@ -1,13 +1,9 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: multiplexer-agent
----
+
 apiVersion: v1
 kind: Secret
 metadata:
   name: multiplexer-agent-certs
-  namespace: multiplexer-agent
+  namespace: quixagent
   labels:
     app: multiplexer-agent
 type: Opaque
@@ -23,7 +19,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: multiplexer-agent
-  namespace: multiplexer-agent
+  namespace: quixagent
   labels:
     app: multiplexer-agent
 spec:
@@ -42,7 +38,7 @@ spec:
           imagePullPolicy: IfNotPresent
           env:
             - name: SERVER_HOST
-              value: "servermultiplexer.multiplexer.svc.cluster.local"
+              value: "15.236.64.94"
             - name: H2_PORT
               value: "8443"
             - name: AGENT_ID
@@ -50,9 +46,9 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name
             - name: FORWARD_HOST
-              value: "10.0.0.1"
+              value: "k8s-quixngr-quixtrae-eced2867d-9f5cb153febd8f2f.elb.eu-central-1.amazonaws.com"
             - name: FORWARD_PORT
-              value: "6443"
+              value: "443"
             - name: TLS_CERT_FILE
               value: "/certs/agent.crt"
             - name: TLS_KEY_FILE
