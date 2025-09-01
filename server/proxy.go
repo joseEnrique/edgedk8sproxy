@@ -1301,9 +1301,7 @@ func (s *Server) handleMultiplexedTunnel(w http.ResponseWriter, r *http.Request,
 func (s *Server) handleWriteQueue(mux *MultiplexedManager) {
 	log.Printf("🚀 Starting non-blocking write queue for agent %s", mux.agentID)
 
-	batch := bytesBufferPool.Get().(*bytes.Buffer)
-	batch.Reset()
-	defer bytesBufferPool.Put(batch)
+	batch := bytes.NewBuffer(make([]byte, 0, 64*1024))
 
 	framesInBatch := 0
 	bytesInBatch := 0
@@ -1320,7 +1318,11 @@ func (s *Server) handleWriteQueue(mux *MultiplexedManager) {
 		if flusher, ok := mux.toAgent.(http.Flusher); ok {
 			flusher.Flush()
 		}
-		batch.Reset()
+		if batch.Cap() > 128*1024 {
+			batch = bytes.NewBuffer(make([]byte, 0, 64*1024))
+		} else {
+			batch.Reset()
+		}
 		framesInBatch = 0
 		bytesInBatch = 0
 		if flushTimer != nil {

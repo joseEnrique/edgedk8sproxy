@@ -421,9 +421,7 @@ func (a *Agent) handleIncomingFrames(reader io.Reader, connManager *AgentConnect
 
 // handleOutgoingFrames sends data from TCP connections as frames to server
 func (a *Agent) handleOutgoingFrames(writer io.Writer, connManager *AgentConnectionManager, done <-chan struct{}, connectionLost chan<- error) {
-	batchBuf := agentBytesBufferPool.Get().(*bytes.Buffer)
-	batchBuf.Reset()
-	defer agentBytesBufferPool.Put(batchBuf)
+	batchBuf := bytes.NewBuffer(make([]byte, 0, 64*1024))
 
 	framesInBatch := 0
 	bytesInBatch := 0
@@ -437,7 +435,11 @@ func (a *Agent) handleOutgoingFrames(writer io.Writer, connManager *AgentConnect
 		if _, err := writer.Write(batchBuf.Bytes()); err != nil {
 			return err
 		}
-		batchBuf.Reset()
+		if batchBuf.Cap() > 128*1024 {
+			batchBuf = bytes.NewBuffer(make([]byte, 0, 64*1024))
+		} else {
+			batchBuf.Reset()
+		}
 		framesInBatch = 0
 		bytesInBatch = 0
 		if flushTimer != nil {
