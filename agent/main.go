@@ -2,16 +2,24 @@ package main
 
 import (
 	"log"
+	// _ "net/http/pprof"
 	"os"
 	"strconv"
 )
 
 func main() {
+	// Start pprof server for local profiling
+	// go func() {
+	// 	addr := getEnv("PPROF_ADDR", "127.0.0.1:6060")
+	// 	log.Printf("🧩 pprof listening on %s", addr)
+	// 	if err := http.ListenAndServe(addr, nil); err != nil {
+	// 		log.Printf("⚠️ pprof server error: %v", err)
+	// 	}
+	// }()
 	config := &Config{
-		ServerHost: getEnv("SERVER_HOST", "15.236.64.94"),
-		//ServerHost: getEnv("SERVER_HOST", "51.44.245.239"),
-		H2Port:  getEnv("H2_PORT", "8443"),
-		AgentID: getEnv("AGENT_ID", "saubertraefik"),
+		ServerHost: getEnv("SERVER_HOST", "localhost"),
+		H2Port:     getEnv("H2_PORT", "80"),
+		AgentID:    getEnv("AGENT_ID", "test"),
 
 		// Single forwarding target - all TCP traffic goes here
 		ForwardHost: getEnv("FORWARD_HOST", "localhost"),
