@@ -1,0 +1,50 @@
+sequenceDiagram
+    autonumber
+    participant U as "User TCP Client"
+    participant S as "Server (TCP Listener + H2 Handler)"
+    participant M as "MuxManager (connections, writeQueue)"
+    participant A as "Agent (runAlwaysMultiplexed)"
+    participant CM as "Agent ConnManager"
+
+    rect rect
+        note over A,S: "Single ultra-persistent HTTP/2 stream with mTLS"
+        A->>S: "HTTPS POST /tunnel (H2)"
+        S-->>A: "200 OK (stream established)"
+        note over A,S: "Custom frame protocol: 8B header = 4B connID + 4B length, then data"
+    end
+
+    U->>S: "New inbound TCP connection"
+    S->>S: "selectAgentForInitialData()"
+    S->>M: "createMuxConnection(connID via atomic.AddUint32)"
+    note right of S: "Server writes to Agent via writeQueue + handleWriteQueue (non-blocking)"
+    S->>M: "enqueue frame(connID, initialData)"
+    M->>A: "HTTP/2 write(frame) + flush"
+
+    A->>CM: "routeToConnection(connID)"
+    CM->>CM: "Dial target TCP (SetNoDelay/KeepAlive)"
+    CM->>Target: "Write data"
+    Target-->>CM: "Read response"
+
+    CM->>A: "frame(connID, data)"
+    A-->>S: "HTTP/2 body write(frame)"
+    S->>M: "handleIncomingMuxFrames → find connID"
+    M->>U: "Write back to user TCP"
+
+    note over A: "ultraKeepAlive: send heartbeat frame connID=0,length=0"
+    A->>S: "Heartbeat frame (0,0)"
+    S->>S: "Keep-alive maintained"
+
+    rect rect
+        note over S: "Cleanup on stream close: close all TCP conns, clear map, nil manager"
+        note over A: "Buffer pool (64KB), reduced tickers for CPU, adaptive backoff"
+    end
+
+    alt "Connection error (EOF/reset/broken pipe)"
+        A->>A: "connectionLost <- err (from handleIncomingFrames/OutgoingFrames)"
+        A-->>A: "close(done), goroutines exit"
+        A->>A: "runAlwaysMultiplexed: calculateRetryDelay(err)"
+        A->>S: "Re-establish H2 stream after backoff"
+        S-->>A: "200 OK (stream re-established)"
+    else "Normal shutdown"
+        A-->>A: "done closed"
+    end

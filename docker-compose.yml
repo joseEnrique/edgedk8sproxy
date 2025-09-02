@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  server:
+    image: ${SERVER_IMAGE:-quixpublic.azurecr.io/servermultiplexer}:${SERVER_TAG:-latest}
+    container_name: multiplexer-server
+    restart: unless-stopped
+    environment:
+      - PORT=${PORT:-8080}
+      - TCP_PORT=${TCP_PORT:-8081}
+      - H2_PORT=${H2_PORT:-8443}
+      - DOMAIN=${DOMAIN:-localhost}
+      - MAX_CLIENTS=${MAX_CLIENTS:-1000}
+      - TLS_CERT_FILE=/certs/server.crt
+      - TLS_KEY_FILE=/certs/server.key
+      - TLS_CLIENT_CA_FILE=/certs/client-ca.crt
+      - DOMAIN_MAP=quique.es=agent1,midominio.com=agent2
+    ports:
+      - "${PORT:-8080}:8080"
+      - "${TCP_PORT:-8081}:8081"
+      - "${H2_PORT:-8443}:8443"
+    volumes:
+      - ./certs:/certs:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
