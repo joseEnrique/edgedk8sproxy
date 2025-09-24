@@ -76,7 +76,6 @@ type Agent struct {
 
 // H2Stream represents one HTTP/2 stream endpoints
 type H2Stream struct {
-	id          string
 	writeStream io.WriteCloser // server -> agent (response body)
 	readStream  io.ReadCloser  // agent -> server (request body)
 	done        chan struct{}

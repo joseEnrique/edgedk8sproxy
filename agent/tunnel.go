@@ -581,6 +581,12 @@ func (a *Agent) readFromTarget(connManager *AgentConnectionManager, tcpConn *Age
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
 				}
+				// Target closed or fatal error: cleanup and notify server with zero-length frame
+				a.closeConnection(connManager, tcpConn.ID)
+				select {
+				case connManager.outgoing <- OutgoingChunk{connID: tcpConn.ID, data: nil}:
+				default:
+				}
 				return
 			}
 		}

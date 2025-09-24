@@ -37,8 +37,8 @@ func main() {
 
 	// Start HTTP server for admin/API + subdomain routing
 	log.Printf("🚀 Starting HTTP server on port %s", config.Port)
-	log.Printf("📊 Status endpoint: http://localhost:%s/status", config.Port)
-	log.Printf("👥 Agents endpoint: http://localhost:%s/agents", config.Port)
+	log.Printf("📊 Status endpoint: http://%s:%s/status", config.Domain, config.Port)
+	log.Printf("👥 Agents endpoint: http://%s:%s/agents", config.Domain, config.Port)
 	log.Printf("🌐 Subdomain routing: agent1.%s, agent2.%s, etc.", config.Domain, config.Domain)
 	log.Printf("🔌 Max Agents: %d", config.MaxClients)
 
